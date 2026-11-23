@@ -104,6 +104,7 @@ class ModelUploader
 		zsortHead = new char[MAX_DIAMETER];
 		zsortTail = new char[MAX_DIAMETER];
 		zsortNext = new char[MAX_FACE_COUNT];
+		Arrays.fill(zsortHead, (char) -1);
 
 		modelProjectedX = new float[MAX_VERTEX_COUNT];
 		modelProjectedY = new float[MAX_VERTEX_COUNT];
@@ -158,6 +159,10 @@ class ModelUploader
 		final byte[] transparencies = model.getFaceTransparencies();
 		final byte modelTransparency = model.getTransparency();
 		final byte[] bias = model.getFaceBias();
+		final byte overrideAmount = model.getOverrideAmount();
+		final byte overrideHue = overrideAmount > 0 ? model.getOverrideHue() : 0;
+		final byte overrideSat = overrideAmount > 0 ? model.getOverrideSaturation() : 0;
+		final byte overrideLum = overrideAmount > 0 ? model.getOverrideLuminance() : 0;
 
 		float orientSine = 0;
 		float orientCosine = 0;
@@ -230,10 +235,7 @@ class ModelUploader
 				+ " pos=(" + x + "," + y + "," + z + ")");
 		}
 
-		Arrays.fill(zsortHead, 0, diameter, (char) -1);
-		Arrays.fill(zsortTail, 0, diameter, (char) -1);
-
-		int minFz = diameter, maxFz = 0;
+		int minFz = diameter, maxFz = -1;
 		for (char faceIdx = 0; faceIdx < faceCount; ++faceIdx)
 		{
 			if (faceColors3[faceIdx] != -2)
@@ -255,7 +257,7 @@ class ModelUploader
 					int distance = radius + (distances[v1] + distances[v2] + distances[v3]) / 3;
 					assert distance >= 0 && distance < diameter;
 
-					if (zsortTail[distance] == (char) -1)
+					if (zsortHead[distance] == (char) -1)
 					{
 						zsortHead[distance] = zsortTail[distance] = faceIdx;
 						zsortNext[faceIdx] = (char) -1;
@@ -302,11 +304,11 @@ class ModelUploader
 					// HSL override is not applied to textured faces
 					if (faceTextures == null || faceTextures[faceIdx] == -1)
 					{
-						if (model.getOverrideAmount() > 0)
+						if (overrideAmount > 0)
 						{
-							color1 = interpolateHSL(color1, model.getOverrideHue(), model.getOverrideSaturation(), model.getOverrideLuminance(), model.getOverrideAmount());
-							color2 = interpolateHSL(color2, model.getOverrideHue(), model.getOverrideSaturation(), model.getOverrideLuminance(), model.getOverrideAmount());
-							color3 = interpolateHSL(color3, model.getOverrideHue(), model.getOverrideSaturation(), model.getOverrideLuminance(), model.getOverrideAmount());
+							color1 = interpolateHSL(color1, overrideHue, overrideSat, overrideLum, overrideAmount);
+							color2 = interpolateHSL(color2, overrideHue, overrideSat, overrideLum, overrideAmount);
+							color3 = interpolateHSL(color3, overrideHue, overrideSat, overrideLum, overrideAmount);
 						}
 					}
 
@@ -357,7 +359,10 @@ class ModelUploader
 		{
 			for (int i = maxFz; i >= minFz; --i)
 			{
-				for (char face = zsortHead[i]; face != (char) -1; face = zsortNext[face])
+				char face = zsortHead[i];
+				if (face == (char) -1) continue;
+				zsortHead[i] = (char) -1;
+				for (; face != (char) -1; face = zsortNext[face])
 				{
 					appendFace(face * FACE_SIZE, opaqueBuffer, alphaBuffer);
 				}
@@ -370,7 +375,10 @@ class ModelUploader
 
 			for (int i = maxFz; i >= minFz; --i)
 			{
-				for (char face = zsortHead[i]; face != (char) -1; face = zsortNext[face])
+				char face = zsortHead[i];
+				if (face == (char) -1) continue;
+				zsortHead[i] = (char) -1;
+				for (; face != (char) -1; face = zsortNext[face])
 				{
 					final byte pri = faceRenderPriorities[face];
 					final int distIdx = numOfPriority[pri]++;

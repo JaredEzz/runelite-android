@@ -1995,7 +1995,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		}
 
 		Zone z = ctx.zones[zx][zz];
-		if (!z.initialized) return;
+		if (!z.initialized || z.alphaModels.isEmpty()) return;
 
 		updateEntityProjection(entityProjection);
 		glUniform4i(uniEntityTint, scene.getOverrideHue(), scene.getOverrideSaturation(),

@@ -169,6 +169,7 @@ final class Gfx
 
 	// Per-frame ring for index data the plugin streams in between draws (Zone's sorted alpha)
 	private static final int[] indexRing = new int[3];
+	private static final ByteBuffer[] indexRingMapped = new ByteBuffer[3];
 	private static final long[] indexRingSize = new long[3];
 	private static int indexRingSlot;
 	private static long indexRingPos;
@@ -222,6 +223,7 @@ final class Gfx
 		framebuffer = 0;
 		passOpen = false;
 		Arrays.fill(indexRing, 0);
+		Arrays.fill(indexRingMapped, null);
 		Arrays.fill(indexRingSize, 0);
 		indexRingSlot = 0;
 		indexRingPos = 0;
@@ -607,6 +609,7 @@ final class Gfx
 	{
 		long bytes = (long) indices.remaining() * Integer.BYTES;
 		int slot = indexRingSlot;
+		ByteBuffer m = indexRingMapped[slot];
 		if (indexRing[slot] == 0 || indexRingPos + bytes > indexRingSize[slot])
 		{
 			long size = Math.max(Math.max(indexRingSize[slot] * 2, 256 * 1024), indexRingPos + bytes);
@@ -620,9 +623,12 @@ final class Gfx
 				Vk.bufferResize(indexRing[slot], size, indexRingPos);
 			}
 			indexRingSize[slot] = size;
+			m = indexRingMapped[slot] = Vk.bufferMap(indexRing[slot], VkNative.MAP_UNSYNCHRONIZED);
 		}
-		// This slot's previous frame has finished, so writing behind the GPU is safe
-		ByteBuffer m = Vk.bufferMap(indexRing[slot], VkNative.MAP_UNSYNCHRONIZED);
+		else if (m == null)
+		{
+			m = indexRingMapped[slot] = Vk.bufferMap(indexRing[slot], VkNative.MAP_UNSYNCHRONIZED);
+		}
 		long offset = indexRingPos;
 		copyInto(m, (int) offset, indices, (int) bytes);
 		indexRingPos += (bytes + 15) & ~15L;
@@ -820,12 +826,14 @@ final class Gfx
 		if (u == null) return;
 		if (u.inBlock)
 		{
+			if (u.program.block.getInt(u.offset) == x) return;
 			u.program.block.putInt(u.offset, x);
 			u.program.blockDirty = true;
 		}
 		else
 		{
 			int w = u.offset >> 2;
+			if (u.program.push[w] == x) return;
 			u.program.push[w] = x;
 			Vk.pushRangeChanged(u.program.push, w, 1);
 		}
@@ -838,16 +846,21 @@ final class Gfx
 		if (u == null) return;
 		if (u.inBlock)
 		{
-			u.program.block.putInt(u.offset, x);
-			u.program.block.putInt(u.offset + 4, y);
+			ByteBuffer b = u.program.block;
+			int o = u.offset;
+			if (b.getInt(o) == x && b.getInt(o + 4) == y) return;
+			b.putInt(o, x);
+			b.putInt(o + 4, y);
 			u.program.blockDirty = true;
 		}
 		else
 		{
 			int w = u.offset >> 2;
-			u.program.push[w] = x;
-			u.program.push[w + 1] = y;
-			Vk.pushRangeChanged(u.program.push, w, 2);
+			int[] p = u.program.push;
+			if (p[w] == x && p[w + 1] == y) return;
+			p[w] = x;
+			p[w + 1] = y;
+			Vk.pushRangeChanged(p, w, 2);
 		}
 	}
 
@@ -858,18 +871,23 @@ final class Gfx
 		if (u == null) return;
 		if (u.inBlock)
 		{
-			u.program.block.putInt(u.offset, x);
-			u.program.block.putInt(u.offset + 4, y);
-			u.program.block.putInt(u.offset + 8, z);
+			ByteBuffer b = u.program.block;
+			int o = u.offset;
+			if (b.getInt(o) == x && b.getInt(o + 4) == y && b.getInt(o + 8) == z) return;
+			b.putInt(o, x);
+			b.putInt(o + 4, y);
+			b.putInt(o + 8, z);
 			u.program.blockDirty = true;
 		}
 		else
 		{
 			int w = u.offset >> 2;
-			u.program.push[w] = x;
-			u.program.push[w + 1] = y;
-			u.program.push[w + 2] = z;
-			Vk.pushRangeChanged(u.program.push, w, 3);
+			int[] p = u.program.push;
+			if (p[w] == x && p[w + 1] == y && p[w + 2] == z) return;
+			p[w] = x;
+			p[w + 1] = y;
+			p[w + 2] = z;
+			Vk.pushRangeChanged(p, w, 3);
 		}
 	}
 
@@ -880,20 +898,25 @@ final class Gfx
 		if (u == null) return;
 		if (u.inBlock)
 		{
-			u.program.block.putInt(u.offset, x);
-			u.program.block.putInt(u.offset + 4, y);
-			u.program.block.putInt(u.offset + 8, z);
-			u.program.block.putInt(u.offset + 12, w);
+			ByteBuffer b = u.program.block;
+			int o = u.offset;
+			if (b.getInt(o) == x && b.getInt(o + 4) == y && b.getInt(o + 8) == z && b.getInt(o + 12) == w) return;
+			b.putInt(o, x);
+			b.putInt(o + 4, y);
+			b.putInt(o + 8, z);
+			b.putInt(o + 12, w);
 			u.program.blockDirty = true;
 		}
 		else
 		{
 			int wo = u.offset >> 2;
-			u.program.push[wo] = x;
-			u.program.push[wo + 1] = y;
-			u.program.push[wo + 2] = z;
-			u.program.push[wo + 3] = w;
-			Vk.pushRangeChanged(u.program.push, wo, 4);
+			int[] p = u.program.push;
+			if (p[wo] == x && p[wo + 1] == y && p[wo + 2] == z && p[wo + 3] == w) return;
+			p[wo] = x;
+			p[wo + 1] = y;
+			p[wo + 2] = z;
+			p[wo + 3] = w;
+			Vk.pushRangeChanged(p, wo, 4);
 		}
 	}
 
