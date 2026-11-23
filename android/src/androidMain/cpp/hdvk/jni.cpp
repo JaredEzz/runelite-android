@@ -187,14 +187,8 @@ JNI_FN(jboolean, imageUpload)(JNIEnv *env, jclass, jint img, jint level, jint x,
 JNI_FN(jboolean, imageUploadInts)(JNIEnv *env, jclass, jint img, jint level, jint x, jint y, jint layer, jint w, jint h, jint layers,
 	jintArray data, jint offsetInts, jint countInts) {
 	if (!alive() || !data) return JNI_FALSE;
-	void *ptr = env->GetPrimitiveArrayCritical(data, nullptr);
-	if (!ptr) return JNI_FALSE;
-	// Copy out of the critical region first; staging may allocate, and no JNI is allowed while held
-	std::vector<uint8_t> copy((size_t) countInts * 4);
-	memcpy(copy.data(), (int32_t *) ptr + offsetInts, copy.size());
-	env->ReleasePrimitiveArrayCritical(data, ptr, JNI_ABORT);
-	return imageUpload(img, (uint32_t) level, x, y, layer, (uint32_t) w, (uint32_t) h, (uint32_t) layers,
-		copy.data(), copy.size(), 0, 0, 0) ? JNI_TRUE : JNI_FALSE;
+	return imageUploadInts(env, img, (uint32_t) level, x, y, layer, (uint32_t) w, (uint32_t) h, (uint32_t) layers,
+		data, offsetInts, countInts) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNI_FN(void, imageGenerateMips)(JNIEnv *, jclass, jint img) {

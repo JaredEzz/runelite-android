@@ -149,6 +149,9 @@ struct Image {
 	SamplerState samplerState;
 	VkSampler sampler = VK_NULL_HANDLE;
 	uint64_t lastUse = 0;
+	// Lazy CPU shadow for dirty-band diffing of repeated int[] uploads (e.g., UI interface texture).
+	std::vector<int32_t> shadowPixels;
+	uint32_t shadowW = 0, shadowH = 0;
 };
 
 struct RenderPassKey {
@@ -418,6 +421,8 @@ void imageDestroy(int handle);
 void destroyImageNow(Image *img);
 bool imageUpload(int handle, uint32_t level, int x, int y, int layer, uint32_t w, uint32_t h, uint32_t layerCount,
 	const void *data, size_t size, int srcBuffer, VkDeviceSize srcOffset, int formatHint);
+bool imageUploadInts(JNIEnv *env, int handle, uint32_t level, int x, int y, int layer,
+	uint32_t w, uint32_t h, uint32_t layerCount, jintArray data, jint offsetInts, jint countInts);
 void imageGenerateMips(int handle);
 void imageSetSampler(int handle, const SamplerState &state);
 VkSampler getSampler(const SamplerState &state);

@@ -62,6 +62,9 @@ public final class Vk {
 	private static int program, layout, indexBuffer;
 	private static int[] currentPush;
 	private static boolean pushDirty = true;
+	private static boolean pushDirtyAll = true;
+	private static int pushDirtyMin = PUSH_CONSTANT_WORDS;
+	private static int pushDirtyMax = 0;
 	private static final int[] viewport = new int[4];
 	private static final int[] emittedViewport = { -1, -1, -1, -1 };
 
@@ -150,6 +153,9 @@ public final class Vk {
 		emittedState = -1;
 		stateDirty = true;
 		pushDirty = true;
+		pushDirtyAll = true;
+		pushDirtyMin = PUSH_CONSTANT_WORDS;
+		pushDirtyMax = 0;
 		program = layout = indexBuffer = 0;
 		emittedViewport[0] = -1;
 		emittedOffsetFactor = emittedOffsetUnits = Float.NaN;
@@ -263,6 +269,7 @@ public final class Vk {
 		if (currentPush != pushData) {
 			currentPush = pushData;
 			pushDirty = true;
+			pushDirtyAll = true;
 		}
 		if (program == prog)
 			return;
@@ -273,8 +280,27 @@ public final class Vk {
 
 	/** A loose uniform in {@code pushData} changed; it reaches the GPU if that program is in use. */
 	public static void pushDataChanged(int[] pushData) {
-		if (pushData == currentPush)
+		if (pushData == currentPush) {
 			pushDirty = true;
+			pushDirtyAll = true;
+		}
+	}
+
+	/** Marks a sub-range of {@code pushData} dirty so only those words are pushed before the next draw. */
+	public static void pushRangeChanged(int[] pushData, int wordOffset, int wordCount) {
+		if (pushData != currentPush || wordCount <= 0)
+			return;
+		if (!pushDirtyAll) {
+			int start = Math.max(0, wordOffset);
+			int end = Math.min(PUSH_CONSTANT_WORDS, wordOffset + wordCount);
+			if (start < end) {
+				if (start < pushDirtyMin) pushDirtyMin = start;
+				if (end > pushDirtyMax) pushDirtyMax = end;
+			} else {
+				pushDirtyAll = true;
+			}
+		}
+		pushDirty = true;
 	}
 
 	public static void bindVertexLayout(int vao, int ebo) {
@@ -327,7 +353,18 @@ public final class Vk {
 	private static void emitDrawState() {
 		if (pushDirty && currentPush != null) {
 			pushDirty = false;
-			pushConstants(0, currentPush, currentPush.length);
+			if (pushDirtyAll || pushDirtyMin >= pushDirtyMax) {
+				pushDirtyAll = false;
+				pushDirtyMin = PUSH_CONSTANT_WORDS;
+				pushDirtyMax = 0;
+				pushConstants(0, currentPush, currentPush.length);
+			} else {
+				int min = pushDirtyMin, count = pushDirtyMax - min;
+				pushDirtyMin = PUSH_CONSTANT_WORDS;
+				pushDirtyMax = 0;
+				reserve(3 + count);
+				stream.put(OP_PUSH).put(min * 4).put(count).put(currentPush, min, count);
+			}
 		}
 		if (stateDirty) {
 			int bits = (blend ? 1 : 0)
@@ -412,6 +449,17 @@ public final class Vk {
 			stream.put(firsts.get(firsts.position() + i)).put(counts.get(counts.position() + i));
 	}
 
+	/** Zero-alloc multiDrawArrays reading indices 0..n without wrapping buffers via duplicate(). */
+	public static void multiDrawArrays(IntBuffer firsts, IntBuffer counts, int n) {
+		if (n <= 0)
+			return;
+		emitDrawState();
+		reserve(2 + n * 2);
+		stream.put(OP_MULTI_DRAW).put(n);
+		for (int i = 0; i < n; i++)
+			stream.put(firsts.get(i)).put(counts.get(i));
+	}
+
 	// ---------------------------------------------------------------------------------------
 	// Passes & transfers
 	// ---------------------------------------------------------------------------------------
@@ -423,6 +471,9 @@ public final class Vk {
 		emittedState = -1;
 		stateDirty = true;
 		pushDirty = true;
+		pushDirtyAll = true;
+		pushDirtyMin = PUSH_CONSTANT_WORDS;
+		pushDirtyMax = 0;
 		emittedViewport[0] = -1;
 		return ok;
 	}
