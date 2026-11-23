@@ -80,6 +80,8 @@ import java.nio.IntBuffer;
 import javax.inject.Inject;
 import net.runelite.api.BufferProvider;
 import net.runelite.api.Client;
+import java.util.Map;
+import java.util.HashMap;
 import net.runelite.api.Constants;
 import net.runelite.api.FloatProjection;
 import net.runelite.api.GameObject;
@@ -1466,7 +1468,300 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		// drawZoneOpaque/Alpha later actually have data to draw.
 		if (!glInitted) return;
 		if (!Gfx.makeCurrent()) return;
+		if (scene.getWorldViewId() == WorldView.TOPLEVEL && nextZones != null)
+		{
+			swapTopLevel();
+		}
+		// Anything still flagged (invalidateZone during the load, sub-scenes, or a load
+		// that fell back to the synchronous path) is rebuilt here as before.
 		rebuild(scene);
+	}
+
+	// ---- Top-level scene loads: zone reuse + off-thread upload (port of GpuPlugin) ----
+	//
+	// The engine calls loadScene(WorldView, Scene) on its "Map Loader" thread and swapScene
+	// on the Client thread. Rebuilding every zone inside swapScene stalled the Client thread
+	// for 1-2 s on each map-region change. Like the desktop GpuPlugin, zones that are still
+	// inside the new scene are reused (shifted by the base delta), and new zones are sized
+	// and uploaded on the loader thread into buffers mapped on the Client thread; swapScene
+	// only frees culled zones, swaps the array and unmaps.
+
+	/** Zones for the scene being loaded; non-null between loadScene and swapScene. */
+	private volatile Zone[][] nextZones;
+	/** True while loadTopLevelAsync runs; zone rebuilds wait so reused zones aren't freed under it. */
+	private volatile boolean sceneLoading;
+	private Map<Integer, Integer> nextRoofChanges;
+
+	private void swapTopLevel()
+	{
+		SceneContext ctx = root;
+		Zone[][] next = nextZones;
+		for (int x = 0; x < ctx.sizeX; ++x)
+		{
+			for (int z = 0; z < ctx.sizeZ; ++z)
+			{
+				Zone zone = ctx.zones[x][z];
+				if (zone.cull)
+				{
+					zone.free();
+				}
+				else if (nextRoofChanges != null && zone.rids != null)
+				{
+					zone.updateRoofs(nextRoofChanges);
+				}
+			}
+		}
+		ctx.zones = next;
+		nextZones = null;
+		nextRoofChanges = null;
+		for (int x = 0; x < ctx.sizeX; ++x)
+		{
+			for (int z = 0; z < ctx.sizeZ; ++z)
+			{
+				Zone zone = ctx.zones[x][z];
+				zone.cull = false;
+				if (!zone.initialized && zone.uploaded)
+				{
+					zone.unmap();
+					zone.initialized = true;
+				}
+			}
+		}
+	}
+
+	/** Frees the not-yet-swapped zones of an abandoned load (Client thread). */
+	private void discardNextZones(Zone[][] next)
+	{
+		if (next == null) return;
+		for (Zone[] col : next)
+		{
+			for (Zone zone : col)
+			{
+				if (zone != null && !zone.initialized && (zone.vboO != null || zone.vboA != null))
+				{
+					if (zone.vboO != null && zone.vboO.mapped) zone.vboO.unmap();
+					if (zone.vboA != null && zone.vboA.mapped) zone.vboA.unmap();
+					zone.free();
+				}
+			}
+		}
+	}
+
+	private boolean runOnClientThread(java.util.function.BooleanSupplier task)
+	{
+		final boolean[] ok = { false };
+		final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+		clientThread.invoke(() ->
+		{
+			try
+			{
+				ok[0] = Gfx.makeCurrent() && task.getAsBoolean();
+			}
+			catch (Throwable t)
+			{
+				Log.w(TAG, "client-thread scene task failed: " + t, t);
+			}
+			finally
+			{
+				latch.countDown();
+			}
+		});
+		try
+		{
+			latch.await();
+		}
+		catch (InterruptedException e)
+		{
+			Thread.currentThread().interrupt();
+			return false;
+		}
+		return ok[0];
+	}
+
+	/**
+	 * Builds {@link #nextZones} for a top-level scene. Returns false (leaving nothing
+	 * half-built) if it can't, in which case the caller falls back to invalidating
+	 * every zone for a synchronous rebuild in swapScene.
+	 */
+	private boolean loadTopLevelAsync(Scene scene)
+	{
+		if (client.isClientThread())
+		{
+			return false; // only worth it off-thread; keep the proven path otherwise
+		}
+		sceneLoading = true;
+		try
+		{
+			return loadTopLevelAsync0(scene);
+		}
+		finally
+		{
+			sceneLoading = false;
+		}
+	}
+
+	private boolean loadTopLevelAsync0(Scene scene)
+	{
+		final Zone[][] abandoned = nextZones;
+		if (abandoned != null)
+		{
+			nextZones = null;
+			nextRoofChanges = null;
+			if (!runOnClientThread(() -> { discardNextZones(abandoned); return true; })) return false;
+		}
+
+		final SceneContext ctx = root;
+		if (ctx == null) return false;
+		final Scene prev = client.getTopLevelWorldView().getScene();
+		final Tile[][][] tiles = scene.getExtendedTiles();
+		final int maxX = Math.min(ctx.sizeX, tiles[0].length >> 3);
+		final int maxZ = Math.min(ctx.sizeZ, tiles[0][0].length >> 3);
+		final Zone[][] cur = ctx.zones;
+
+		for (int x = 0; x < ctx.sizeX; ++x)
+			for (int z = 0; z < ctx.sizeZ; ++z)
+				cur[x][z].cull = true;
+
+		final Map<Integer, Integer> roofChanges = new HashMap<>();
+		final Zone[][] newZones = new Zone[ctx.sizeX][ctx.sizeZ];
+		int reused = 0;
+		if (prev != null && !prev.isInstance() && !scene.isInstance()
+			&& client.getGameState() == GameState.LOGGED_IN)
+		{
+			final Tile[][][] prevTiles = prev.getExtendedTiles();
+			final int prevMaxX = Math.min(ctx.sizeX, prevTiles[0].length >> 3);
+			final int prevMaxZ = Math.min(ctx.sizeZ, prevTiles[0][0].length >> 3);
+			final int dx = scene.getBaseX() - prev.getBaseX() >> 3;
+			final int dz = scene.getBaseY() - prev.getBaseY() >> 3;
+			final int[][][] prids = prev.getRoofs();
+			final int[][][] nrids = scene.getRoofs();
+			for (int x = 0; x < maxX; ++x)
+			{
+				next:
+				for (int z = 0; z < maxZ; ++z)
+				{
+					final int ox = x + dx, oz = z + dz;
+					if (!canReuse(cur, ox, oz, prevMaxX, prevMaxZ)) continue;
+					final Zone old = cur[ox][oz];
+					// dirty: rebuilt after its scene loaded (invalidateZone), so its contents
+					// no longer match a fresh upload; invalidate: a rebuild is still pending.
+					if (old.dirty || old.invalidate) continue;
+					// Roof ids aren't stable across scenes; map old -> new, give up on a split/merge.
+					for (int level = 0; level < 4; level++)
+					{
+						for (int tx = 0; tx < 8; tx++)
+						{
+							for (int tz = 0; tz < 8; tz++)
+							{
+								int prid = prids[level][(ox << 3) + tx][(oz << 3) + tz];
+								int nrid = nrids[level][(x << 3) + tx][(z << 3) + tz];
+								if (prid != nrid && (prid == 0 || nrid == 0)) continue next;
+								Integer orid = roofChanges.putIfAbsent(prid, nrid);
+								if (orid != null && orid != nrid) continue next;
+							}
+						}
+					}
+					old.cull = false;
+					newZones[x][z] = old;
+					reused++;
+				}
+			}
+		}
+
+		for (int x = 0; x < ctx.sizeX; ++x)
+		{
+			for (int z = 0; z < ctx.sizeZ; ++z)
+			{
+				if (newZones[x][z] == null)
+				{
+					Zone zone = newZones[x][z] = new Zone();
+					if (x < maxX && z < maxZ)
+					{
+						mapUploader.zoneSize(scene, zone, x, z);
+					}
+				}
+			}
+		}
+
+		// Buffers are created and mapped on the Client thread (GL/Vk object calls);
+		// the mapped memory is then filled from this thread.
+		final boolean allocated = runOnClientThread(() ->
+		{
+			for (int x = 0; x < maxX; ++x)
+			{
+				for (int z = 0; z < maxZ; ++z)
+				{
+					Zone zone = newZones[x][z];
+					if (zone.initialized) continue;
+					VBO o = null, a = null;
+					int sz = zone.sizeO * Zone.VERT_SIZE * 3;
+					if (sz > 0)
+					{
+						o = new VBO(sz);
+						o.init(GLES20.GL_STATIC_DRAW);
+						o.map();
+					}
+					sz = zone.sizeA * Zone.VERT_SIZE * 3;
+					if (sz > 0)
+					{
+						a = new VBO(sz);
+						a.init(GLES20.GL_STATIC_DRAW);
+						a.map();
+					}
+					zone.init(o, a);
+				}
+			}
+			return true;
+		});
+		if (!allocated)
+		{
+			runOnClientThread(() -> { discardNextZones(newZones); return true; });
+			for (int x = 0; x < ctx.sizeX; ++x)
+				for (int z = 0; z < ctx.sizeZ; ++z)
+					cur[x][z].cull = false;
+			return false;
+		}
+
+		for (int x = 0; x < maxX; ++x)
+		{
+			for (int z = 0; z < maxZ; ++z)
+			{
+				Zone zone = newZones[x][z];
+				if (zone.initialized) continue;
+				try
+				{
+					mapUploader.uploadZone(scene, zone, x, z);
+				}
+				catch (Throwable t)
+				{
+					// Same defence as rebuild(): one bad zone must not lose the scene.
+					Log.w(TAG, "async zone upload failed at (" + x + "," + z + "): " + t, t);
+					zone.invalidate = true;
+				}
+				zone.uploaded = true;
+			}
+		}
+		Log.i(TAG, "loadScene async: reused " + reused + " zones, uploaded " + (maxX * maxZ - reused));
+		nextRoofChanges = roofChanges;
+		nextZones = newZones;
+		return true;
+	}
+
+	/** Zone and its neighbours exist and are built (tile blending, sharelight and shadows cross edges). */
+	private static boolean canReuse(Zone[][] zones, int zx, int zz, int maxX, int maxZ)
+	{
+		for (int x = zx - 1; x <= zx + 1; ++x)
+		{
+			if (x < 0 || x >= maxX) return false;
+			for (int z = zz - 1; z <= zz + 1; ++z)
+			{
+				if (z < 0 || z >= maxZ) return false;
+				Zone zone = zones[x][z];
+				if (!zone.initialized) return false;
+				if (zone.sizeO == 0 && zone.sizeA == 0) return false;
+			}
+		}
+		return true;
 	}
 
 	private void rebuild(Scene scene)
@@ -1607,6 +1902,26 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		{
 			subs[id] = new SceneContext(wv.getSizeX() >> 3, wv.getSizeY() >> 3);
 		}
+		if (id == WorldView.TOPLEVEL && glInitted)
+		{
+			try
+			{
+				if (loadTopLevelAsync(scene)) return;
+			}
+			catch (Throwable t)
+			{
+				Log.w(TAG, "async scene load failed, falling back to full rebuild: " + t, t);
+				final Zone[][] partial = nextZones;
+				nextZones = null;
+				nextRoofChanges = null;
+				if (partial != null) runOnClientThread(() -> { discardNextZones(partial); return true; });
+				SceneContext ctx = root;
+				if (ctx != null)
+					for (int x = 0; x < ctx.sizeX; ++x)
+						for (int z = 0; z < ctx.sizeZ; ++z)
+							ctx.zones[x][z].cull = false;
+			}
+		}
 		loadScene(scene);
 	}
 
@@ -1660,6 +1975,9 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 	{
 		SceneContext ctx = context(scene);
 		if (ctx == null) return;
+		// A top-level load in flight may be reusing these zones; the flags persist and
+		// swapScene rebuilds whatever is still invalidated, at the zones' new positions.
+		if (ctx == root && (sceneLoading || nextZones != null)) return;
 		// Cheap fast path: bail out of the EGL/GL section entirely when nothing changed
 		// this tick. Clamped to the scene's real tile dims so we don't pick up stale
 		// invalidate=true on zones beyond the scene bounds (otherwise we'd trip the

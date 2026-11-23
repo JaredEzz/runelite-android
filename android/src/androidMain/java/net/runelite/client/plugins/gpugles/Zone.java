@@ -74,6 +74,8 @@ class Zone
 	boolean cull;
 	boolean dirty;
 	boolean invalidate;
+	/** Filled by the async scene loader; unmapped and marked initialized on swap. */
+	volatile boolean uploaded;
 
 	int[] levelOffsets = new int[4]; // buffer pos in ints for the end of the level
 
