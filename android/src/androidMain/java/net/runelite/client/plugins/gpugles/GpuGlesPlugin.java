@@ -1490,6 +1490,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 	private volatile Zone[][] nextZones;
 	/** True while loadTopLevelAsync runs; zone rebuilds wait so reused zones aren't freed under it. */
 	private volatile boolean sceneLoading;
+	private volatile int invalidateCalls, invalidateDuringLoad;
 	private Map<Integer, Integer> nextRoofChanges;
 
 	private void swapTopLevel()
@@ -1624,9 +1625,10 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 
 		final Map<Integer, Integer> roofChanges = new HashMap<>();
 		final Zone[][] newZones = new Zone[ctx.sizeX][ctx.sizeZ];
-		int reused = 0;
-		if (prev != null && !prev.isInstance() && !scene.isInstance()
-			&& client.getGameState() == GameState.LOGGED_IN)
+		int reused = 0, rNoNb = 0, rDirty = 0, rRoof = 0;
+		final String gate = prev == null ? "noPrev" : prev == scene ? "sameScene"
+			: prev.isInstance() || scene.isInstance() ? "instance" : "state=" + client.getGameState();
+		if (prev != null && !prev.isInstance() && !scene.isInstance())
 		{
 			final Tile[][][] prevTiles = prev.getExtendedTiles();
 			final int prevMaxX = Math.min(ctx.sizeX, prevTiles[0].length >> 3);
@@ -1641,11 +1643,11 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 				for (int z = 0; z < maxZ; ++z)
 				{
 					final int ox = x + dx, oz = z + dz;
-					if (!canReuse(cur, ox, oz, prevMaxX, prevMaxZ)) continue;
+					if (!canReuse(cur, ox, oz, prevMaxX, prevMaxZ)) { rNoNb++; continue; }
 					final Zone old = cur[ox][oz];
 					// dirty: rebuilt after its scene loaded (invalidateZone), so its contents
 					// no longer match a fresh upload; invalidate: a rebuild is still pending.
-					if (old.dirty || old.invalidate) continue;
+					if (old.dirty || old.invalidate) { rDirty++; continue; }
 					// Roof ids aren't stable across scenes; map old -> new, give up on a split/merge.
 					for (int level = 0; level < 4; level++)
 					{
@@ -1655,9 +1657,9 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 							{
 								int prid = prids[level][(ox << 3) + tx][(oz << 3) + tz];
 								int nrid = nrids[level][(x << 3) + tx][(z << 3) + tz];
-								if (prid != nrid && (prid == 0 || nrid == 0)) continue next;
+								if (prid != nrid && (prid == 0 || nrid == 0)) { rRoof++; continue next; }
 								Integer orid = roofChanges.putIfAbsent(prid, nrid);
-								if (orid != null && orid != nrid) continue next;
+								if (orid != null && orid != nrid) { rRoof++; continue next; }
 							}
 						}
 					}
@@ -1741,7 +1743,12 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 				zone.uploaded = true;
 			}
 		}
-		Log.i(TAG, "loadScene async: reused " + reused + " zones, uploaded " + (maxX * maxZ - reused));
+		Log.i(TAG, "loadScene async: reused " + reused + " zones, uploaded " + (maxX * maxZ - reused)
+			+ " [" + gate + " d=" + ((scene.getBaseX() - (prev == null ? 0 : prev.getBaseX())) >> 3) + "," + ((scene.getBaseY() - (prev == null ? 0 : prev.getBaseY())) >> 3)
+			+ " noNeighbours=" + rNoNb + " dirtyOrInvalid=" + rDirty + " roof=" + rRoof
+			+ " invalidateZone since last load=" + invalidateCalls + " (during load " + invalidateDuringLoad + ")]");
+		invalidateCalls = 0;
+		invalidateDuringLoad = 0;
 		nextRoofChanges = roofChanges;
 		nextZones = newZones;
 		return true;
@@ -1780,6 +1787,8 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		final Tile[][][] tiles = scene.getExtendedTiles();
 		final int maxX = Math.min(ctx.sizeX, tiles[0].length >> 3);
 		final int maxZ = Math.min(ctx.sizeZ, tiles[0][0].length >> 3);
+		int rebuilt = 0;
+		final long t0 = System.nanoTime();
 
 		for (int x = 0; x < maxX; ++x)
 		{
@@ -1794,6 +1803,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 				// invalidated-but-unbuilt until the next swapScene. A user reported
 				// "crash on region reload"; this catch keeps the rest of the scene
 				// building so one bad object can only blank one zone.
+				rebuilt++;
 				try
 				{
 					rebuildOneZone(scene, ctx, x, z);
@@ -1807,6 +1817,11 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 					ctx.zones[x][z].invalidate = true;
 				}
 			}
+		}
+		if (rebuilt > 4)
+		{
+			Log.i(TAG, "sync zone rebuild: " + rebuilt + " zones in " + (System.nanoTime() - t0) / 1_000_000 + " ms (wv "
+				+ scene.getWorldViewId() + ", from " + Thread.currentThread().getStackTrace()[3].getMethodName() + ")");
 		}
 	}
 
@@ -1852,6 +1867,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		// preSceneDraw via the invalidate flag.
 		SceneContext ctx = context(scene);
 		if (ctx == null) return;
+		Log.i(TAG, "loadScene(Scene) full invalidate wv=" + scene.getWorldViewId() + " thread=" + Thread.currentThread().getName());
 		final Tile[][][] tiles = scene.getExtendedTiles();
 		final int maxX = Math.min(ctx.sizeX, tiles[0].length >> 3);
 		final int maxZ = Math.min(ctx.sizeZ, tiles[0][0].length >> 3);
@@ -1940,6 +1956,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		SceneContext ctx = context(scene);
 		if (ctx == null) return;
 		if (zx < 0 || zz < 0 || zx >= ctx.sizeX || zz >= ctx.sizeZ) return;
+		if (ctx == root) { invalidateCalls++; if (sceneLoading || nextZones != null) invalidateDuringLoad++; }
 		Zone z = ctx.zones[zx][zz];
 		if (!z.invalidate)
 		{
