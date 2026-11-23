@@ -517,7 +517,7 @@ class Zone
 			boolean ok = false;
 			if (level >= minLevel && level <= maxLevel)
 			{
-				if (level <= currentLevel || !hiddenRoofIds.contains((int) m.rid))
+				if (level <= currentLevel || hiddenRoofIds.isEmpty() || !hiddenRoofIds.contains((int) m.rid))
 				{
 					ok = true;
 				}

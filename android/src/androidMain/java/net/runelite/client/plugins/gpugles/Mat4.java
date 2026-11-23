@@ -93,6 +93,68 @@ public class Mat4
 		};
 	}
 
+	private static void zero(float[] m)
+	{
+		for (int i = 0; i < 16; ++i) m[i] = 0f;
+	}
+
+	public static void setScale(float[] m, float sx, float sy, float sz)
+	{
+		zero(m);
+		m[0] = sx;
+		m[5] = sy;
+		m[10] = sz;
+		m[15] = 1f;
+	}
+
+	public static void setTranslate(float[] m, float tx, float ty, float tz)
+	{
+		zero(m);
+		m[0] = 1f;
+		m[5] = 1f;
+		m[10] = 1f;
+		m[12] = tx;
+		m[13] = ty;
+		m[14] = tz;
+		m[15] = 1f;
+	}
+
+	public static void setRotateX(float[] m, float rx)
+	{
+		zero(m);
+		float s = (float) Math.sin(rx);
+		float c = (float) Math.cos(rx);
+		m[0] = 1f;
+		m[5] = c;
+		m[6] = s;
+		m[9] = -s;
+		m[10] = c;
+		m[15] = 1f;
+	}
+
+	public static void setRotateY(float[] m, float ry)
+	{
+		zero(m);
+		float s = (float) Math.sin(ry);
+		float c = (float) Math.cos(ry);
+		m[0] = c;
+		m[2] = -s;
+		m[5] = 1f;
+		m[8] = s;
+		m[10] = c;
+		m[15] = 1f;
+	}
+
+	public static void setProjection(float[] m, float w, float h, float n)
+	{
+		zero(m);
+		m[0] = 2f / w;
+		m[5] = -2f / h;
+		m[10] = 1f;
+		m[11] = 1f;
+		m[14] = -4f * n;
+	}
+
 	public static void mul(final float[] a, final float[] b)
 	{
 		final float b00 = b[0 + 0 * 4];

@@ -9,6 +9,7 @@ import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -90,19 +91,77 @@ final class Gfx
 		int stride;
 	}
 
-	private static int nextId = 1;
-	private static final Map<Integer, VkBuf> buffers = new HashMap<>();
-	private static final Map<Integer, VkTex> textures = new HashMap<>();
-	private static final Map<Integer, VkProg> programs = new HashMap<>();
-	private static final Map<Integer, Integer> vaoElementBuffer = new HashMap<>();
+	private static int nextBufId = 1, nextTexId = 1, nextProgId = 1;
+	private static VkBuf[] buffers = new VkBuf[256];
+	private static int[] freeBufIds = new int[64];
+	private static int freeBufTop = 0;
+	private static VkTex[] textures = new VkTex[64];
+	private static int[] freeTexIds = new int[32];
+	private static int freeTexTop = 0;
+	private static VkProg[] programs = new VkProg[16];
+	private static int[] vaoElementBuffer = new int[64];
 	/** Index = GL uniform location - 1 */
 	private static final List<Uniform> uniforms = new ArrayList<>();
 
 	private static int boundArrayBuffer, boundElementBuffer, boundUniformBuffer, boundVao;
+	private static int boundLooseBlockBuffer = 0;
 	private static VkProg currentProgram;
 	private static int activeUnit;
 	private static final int[] unitTextures = new int[8];
 	private static final int[] emittedUnitImages = new int[8];
+	private static boolean unitTexturesDirty = true;
+
+	private static VkBuf getBuf(int id)
+	{
+		return id > 0 && id < buffers.length ? buffers[id] : null;
+	}
+
+	private static int allocBufId(VkBuf b)
+	{
+		int id = freeBufTop > 0 ? freeBufIds[--freeBufTop] : nextBufId++;
+		if (id >= buffers.length) buffers = Arrays.copyOf(buffers, Math.max(buffers.length << 1, id + 1));
+		buffers[id] = b;
+		return id;
+	}
+
+	private static VkTex getTex(int id)
+	{
+		return id > 0 && id < textures.length ? textures[id] : null;
+	}
+
+	private static int allocTexId(VkTex t)
+	{
+		int id = freeTexTop > 0 ? freeTexIds[--freeTexTop] : nextTexId++;
+		if (id >= textures.length) textures = Arrays.copyOf(textures, Math.max(textures.length << 1, id + 1));
+		textures[id] = t;
+		return id;
+	}
+
+	private static VkProg getProg(int id)
+	{
+		return id > 0 && id < programs.length ? programs[id] : null;
+	}
+
+	private static int allocProgId(VkProg p)
+	{
+		int id = nextProgId++;
+		if (id >= programs.length) programs = Arrays.copyOf(programs, Math.max(programs.length << 1, id + 1));
+		programs[id] = p;
+		return id;
+	}
+
+	private static int getVaoEbo(int vao)
+	{
+		return vao > 0 && vao < vaoElementBuffer.length ? vaoElementBuffer[vao] : 0;
+	}
+
+	private static void setVaoEbo(int vao, int ebo)
+	{
+		if (vao <= 0) return;
+		if (vao >= vaoElementBuffer.length)
+			vaoElementBuffer = Arrays.copyOf(vaoElementBuffer, Math.max(vaoElementBuffer.length << 1, vao + 1));
+		vaoElementBuffer[vao] = ebo;
+	}
 
 	private static int framebuffer; // Vk framebuffer handle, 0 = swapchain
 	private static boolean passOpen;
@@ -145,20 +204,25 @@ final class Gfx
 
 	private static void resetVulkanState()
 	{
-		buffers.clear();
-		textures.clear();
-		programs.clear();
-		vaoElementBuffer.clear();
+		Arrays.fill(buffers, null);
+		Arrays.fill(textures, null);
+		Arrays.fill(programs, null);
+		Arrays.fill(vaoElementBuffer, 0);
+		nextBufId = nextTexId = nextProgId = 1;
+		freeBufTop = freeTexTop = 0;
 		uniforms.clear();
+		uniformNames.clear();
 		boundArrayBuffer = boundElementBuffer = boundUniformBuffer = boundVao = 0;
+		boundLooseBlockBuffer = 0;
 		currentProgram = null;
 		activeUnit = 0;
-		java.util.Arrays.fill(unitTextures, 0);
-		java.util.Arrays.fill(emittedUnitImages, -1);
+		Arrays.fill(unitTextures, 0);
+		Arrays.fill(emittedUnitImages, -1);
+		unitTexturesDirty = true;
 		framebuffer = 0;
 		passOpen = false;
-		java.util.Arrays.fill(indexRing, 0);
-		java.util.Arrays.fill(indexRingSize, 0);
+		Arrays.fill(indexRing, 0);
+		Arrays.fill(indexRingSize, 0);
 		indexRingSlot = 0;
 		indexRingPos = 0;
 		lastSurfaceWidth = lastSurfaceHeight = 0;
@@ -193,7 +257,9 @@ final class Gfx
 		// A new swapchain submits what was recorded so far, closing any open pass natively
 		endPass();
 		Vk.setSurface(surface);
-		java.util.Arrays.fill(emittedUnitImages, -1);
+		Arrays.fill(emittedUnitImages, -1);
+		unitTexturesDirty = true;
+		boundLooseBlockBuffer = 0;
 	}
 
 	/** @return false if the Vulkan device was lost */
@@ -208,7 +274,9 @@ final class Gfx
 		boolean ok = Vk.endFrame();
 		indexRingSlot = (indexRingSlot + 1) % indexRing.length;
 		indexRingPos = 0;
-		java.util.Arrays.fill(emittedUnitImages, -1);
+		Arrays.fill(emittedUnitImages, -1);
+		unitTexturesDirty = true;
+		boundLooseBlockBuffer = 0;
 		return ok;
 	}
 
@@ -241,7 +309,8 @@ final class Gfx
 		if (passOpen) return;
 		passOpen = Vk.beginPass(framebuffer == 0 ? VkNative.SWAPCHAIN : framebuffer,
 			VkNative.LOAD, 0, 0, 0, 1, VkNative.LOAD, 1, false);
-		java.util.Arrays.fill(emittedUnitImages, -1);
+		Arrays.fill(emittedUnitImages, -1);
+		unitTexturesDirty = true;
 	}
 
 	static void glBindFramebuffer(int target, int fb)
@@ -275,7 +344,8 @@ final class Gfx
 		passOpen = Vk.beginPass(framebuffer == 0 ? VkNative.SWAPCHAIN : framebuffer,
 			color ? VkNative.CLEAR : VkNative.LOAD, clearR, clearG, clearB, clearA,
 			depth ? VkNative.CLEAR : VkNative.LOAD, clearDepth, false);
-		java.util.Arrays.fill(emittedUnitImages, -1);
+		Arrays.fill(emittedUnitImages, -1);
+		unitTexturesDirty = true;
 	}
 
 	/** Attachments are never stored past their pass on Vulkan, so there is nothing to discard. */
@@ -370,9 +440,7 @@ final class Gfx
 		if (!vulkan) { GLES20.glGenBuffers(n, ids, offset); return; }
 		for (int i = 0; i < n; ++i)
 		{
-			int id = nextId++;
-			buffers.put(id, new VkBuf());
-			ids[offset + i] = id;
+			ids[offset + i] = allocBufId(new VkBuf());
 		}
 	}
 
@@ -381,8 +449,19 @@ final class Gfx
 		if (!vulkan) { GLES20.glDeleteBuffers(n, ids, offset); return; }
 		for (int i = 0; i < n; ++i)
 		{
-			VkBuf b = buffers.remove(ids[offset + i]);
-			if (b != null && b.handle != 0) Vk.bufferDestroy(b.handle);
+			int id = ids[offset + i];
+			VkBuf b = getBuf(id);
+			if (b != null)
+			{
+				buffers[id] = null;
+				if (freeBufTop == freeBufIds.length) freeBufIds = Arrays.copyOf(freeBufIds, freeBufIds.length << 1);
+				freeBufIds[freeBufTop++] = id;
+				if (b.handle != 0)
+				{
+					if (boundLooseBlockBuffer == b.handle) boundLooseBlockBuffer = 0;
+					Vk.bufferDestroy(b.handle);
+				}
+			}
 		}
 	}
 
@@ -395,7 +474,7 @@ final class Gfx
 			case GLES20.GL_ELEMENT_ARRAY_BUFFER:
 				boundElementBuffer = id;
 				// Element buffer bindings are vertex-array state in GL
-				if (boundVao != 0) vaoElementBuffer.put(boundVao, id);
+				if (boundVao != 0) setVaoEbo(boundVao, id);
 				break;
 			case GLES30.GL_UNIFORM_BUFFER: boundUniformBuffer = id; break;
 			default: break;
@@ -427,7 +506,7 @@ final class Gfx
 	/** The Vulkan buffer for a GL buffer id, sized at least {@code size}. */
 	private static VkBuf storage(int id, int target, long size)
 	{
-		VkBuf b = buffers.get(id);
+		VkBuf b = getBuf(id);
 		if (b == null) return null;
 		size = Math.max(size, 16);
 		if (b.handle == 0)
@@ -509,8 +588,12 @@ final class Gfx
 	static void glBindBufferBase(int target, int index, int id)
 	{
 		if (!vulkan) { GLES30.glBindBufferBase(target, index, id); return; }
-		VkBuf b = buffers.get(id);
-		if (b != null && b.handle != 0) Vk.bindUniformBuffer(index, b.handle);
+		VkBuf b = getBuf(id);
+		if (b != null && b.handle != 0)
+		{
+			Vk.bindUniformBuffer(index, b.handle);
+			if (index == LOOSE_BLOCK_BINDING) boundLooseBlockBuffer = b.handle;
+		}
 	}
 
 	/**
@@ -566,7 +649,7 @@ final class Gfx
 		for (int i = 0; i < n; ++i)
 		{
 			int vao = ids[offset + i];
-			vaoElementBuffer.remove(vao);
+			if (vao > 0 && vao < vaoElementBuffer.length) vaoElementBuffer[vao] = 0;
 			if (vao == boundVao) boundVao = 0;
 			Vk.layoutDestroy(vao);
 		}
@@ -576,8 +659,7 @@ final class Gfx
 	{
 		if (!vulkan) { GLES30.glBindVertexArray(vao); return; }
 		boundVao = vao;
-		Integer ebo = vaoElementBuffer.get(vao);
-		boundElementBuffer = ebo != null ? ebo : 0;
+		boundElementBuffer = getVaoEbo(vao);
 	}
 
 	static void glEnableVertexAttribArray(int index)
@@ -599,7 +681,7 @@ final class Gfx
 
 	private static void attrib(int index, int size, int type, boolean normalized, boolean integer, int stride, int offset)
 	{
-		VkBuf b = buffers.get(boundArrayBuffer);
+		VkBuf b = getBuf(boundArrayBuffer);
 		if (boundVao == 0 || b == null)
 		{
 			Log.w(TAG, "vertex attribute " + index + " without a vertex array or buffer");
@@ -631,19 +713,19 @@ final class Gfx
 		}
 		VkProg p = new VkProg();
 		p.handle = handle;
+		int id = allocProgId(p);
 		if (adapted.blockSize > 0)
 		{
 			p.block = ByteBuffer.allocateDirect(adapted.blockSize).order(ByteOrder.nativeOrder());
 			p.blockBuffer = Vk.bufferCreate(adapted.blockSize, VkNative.BUF_UNIFORM);
 			p.blockDirty = true;
 		}
-		programs.put(handle, p);
 		for (var e : adapted.pushUniforms.entrySet())
 		{
 			Uniform u = new Uniform();
 			u.program = p;
 			u.offset = e.getValue().offset;
-			uniformNames.put(key(handle, e.getKey()), u);
+			uniformNames.put(key(id, e.getKey()), u);
 		}
 		for (var e : adapted.blockUniforms.entrySet())
 		{
@@ -652,9 +734,9 @@ final class Gfx
 			u.inBlock = true;
 			u.offset = e.getValue().offset;
 			u.stride = e.getValue().stride;
-			uniformNames.put(key(handle, e.getKey()), u);
+			uniformNames.put(key(id, e.getKey()), u);
 		}
-		return handle;
+		return id;
 	}
 
 	private static final Map<String, Uniform> uniformNames = new HashMap<>();
@@ -667,19 +749,24 @@ final class Gfx
 	static void glDeleteProgram(int program)
 	{
 		if (!vulkan) { GLES20.glDeleteProgram(program); return; }
-		VkProg p = programs.remove(program);
+		VkProg p = getProg(program);
 		if (p == null) return;
+		programs[program] = null;
 		if (currentProgram == p) currentProgram = null;
-		if (p.blockBuffer != 0) Vk.bufferDestroy(p.blockBuffer);
+		if (p.blockBuffer != 0)
+		{
+			if (boundLooseBlockBuffer == p.blockBuffer) boundLooseBlockBuffer = 0;
+			Vk.bufferDestroy(p.blockBuffer);
+		}
 		uniformNames.values().removeIf(u -> u.program == p);
-		Vk.programDestroy(program);
+		Vk.programDestroy(p.handle);
 	}
 
 	static void glUseProgram(int program)
 	{
 		if (!vulkan) { GLES20.glUseProgram(program); return; }
 		if (program == 0) return; // Vulkan always draws with some program; keep the last one
-		VkProg p = programs.get(program);
+		VkProg p = getProg(program);
 		if (p == null) return;
 		currentProgram = p;
 		Vk.useProgram(p.handle, p.push);
@@ -711,20 +798,6 @@ final class Gfx
 		return location > 0 && location <= uniforms.size() ? uniforms.get(location - 1) : null;
 	}
 
-	private static void setInts(Uniform u, int... v)
-	{
-		if (u.inBlock)
-		{
-			for (int i = 0; i < v.length; ++i) u.program.block.putInt(u.offset + i * 4, v[i]);
-			u.program.blockDirty = true;
-		}
-		else
-		{
-			System.arraycopy(v, 0, u.program.push, u.offset / 4, v.length);
-			Vk.pushDataChanged(u.program.push);
-		}
-	}
-
 	private static void setFloats(Uniform u, float[] v, int offset, int count)
 	{
 		if (u.inBlock)
@@ -734,8 +807,9 @@ final class Gfx
 		}
 		else
 		{
-			for (int i = 0; i < count; ++i) u.program.push[u.offset / 4 + i] = Float.floatToRawIntBits(v[offset + i]);
-			Vk.pushDataChanged(u.program.push);
+			int wordOff = u.offset >> 2;
+			for (int i = 0; i < count; ++i) u.program.push[wordOff + i] = Float.floatToRawIntBits(v[offset + i]);
+			Vk.pushRangeChanged(u.program.push, wordOff, count);
 		}
 	}
 
@@ -743,28 +817,84 @@ final class Gfx
 	{
 		if (!vulkan) { GLES20.glUniform1i(location, x); return; }
 		Uniform u = uniform(location);
-		if (u != null) setInts(u, x);
+		if (u == null) return;
+		if (u.inBlock)
+		{
+			u.program.block.putInt(u.offset, x);
+			u.program.blockDirty = true;
+		}
+		else
+		{
+			int w = u.offset >> 2;
+			u.program.push[w] = x;
+			Vk.pushRangeChanged(u.program.push, w, 1);
+		}
 	}
 
 	static void glUniform2i(int location, int x, int y)
 	{
 		if (!vulkan) { GLES20.glUniform2i(location, x, y); return; }
 		Uniform u = uniform(location);
-		if (u != null) setInts(u, x, y);
+		if (u == null) return;
+		if (u.inBlock)
+		{
+			u.program.block.putInt(u.offset, x);
+			u.program.block.putInt(u.offset + 4, y);
+			u.program.blockDirty = true;
+		}
+		else
+		{
+			int w = u.offset >> 2;
+			u.program.push[w] = x;
+			u.program.push[w + 1] = y;
+			Vk.pushRangeChanged(u.program.push, w, 2);
+		}
 	}
 
 	static void glUniform3i(int location, int x, int y, int z)
 	{
 		if (!vulkan) { GLES20.glUniform3i(location, x, y, z); return; }
 		Uniform u = uniform(location);
-		if (u != null) setInts(u, x, y, z);
+		if (u == null) return;
+		if (u.inBlock)
+		{
+			u.program.block.putInt(u.offset, x);
+			u.program.block.putInt(u.offset + 4, y);
+			u.program.block.putInt(u.offset + 8, z);
+			u.program.blockDirty = true;
+		}
+		else
+		{
+			int w = u.offset >> 2;
+			u.program.push[w] = x;
+			u.program.push[w + 1] = y;
+			u.program.push[w + 2] = z;
+			Vk.pushRangeChanged(u.program.push, w, 3);
+		}
 	}
 
 	static void glUniform4i(int location, int x, int y, int z, int w)
 	{
 		if (!vulkan) { GLES20.glUniform4i(location, x, y, z, w); return; }
 		Uniform u = uniform(location);
-		if (u != null) setInts(u, x, y, z, w);
+		if (u == null) return;
+		if (u.inBlock)
+		{
+			u.program.block.putInt(u.offset, x);
+			u.program.block.putInt(u.offset + 4, y);
+			u.program.block.putInt(u.offset + 8, z);
+			u.program.block.putInt(u.offset + 12, w);
+			u.program.blockDirty = true;
+		}
+		else
+		{
+			int wo = u.offset >> 2;
+			u.program.push[wo] = x;
+			u.program.push[wo + 1] = y;
+			u.program.push[wo + 2] = z;
+			u.program.push[wo + 3] = w;
+			Vk.pushRangeChanged(u.program.push, wo, 4);
+		}
 	}
 
 	private static final float[] scratch = new float[4];
@@ -818,16 +948,13 @@ final class Gfx
 		if (!vulkan) { GLES20.glGenTextures(n, ids, offset); return; }
 		for (int i = 0; i < n; ++i)
 		{
-			int id = nextId++;
-			textures.put(id, new VkTex());
-			ids[offset + i] = id;
+			ids[offset + i] = allocTexId(new VkTex());
 		}
 	}
 
 	/** Vulkan: wrap an image the plugin created itself (a scene target) as a texture id. */
 	static int wrapImage(int image, int width, int height)
 	{
-		int id = nextId++;
 		VkTex t = new VkTex();
 		t.image = image;
 		t.target = GLES20.GL_TEXTURE_2D;
@@ -837,7 +964,7 @@ final class Gfx
 		t.owned = false;
 		t.minFilter = t.magFilter = GLES20.GL_LINEAR;
 		t.wrapS = t.wrapT = GLES20.GL_CLAMP_TO_EDGE;
-		textures.put(id, t);
+		int id = allocTexId(t);
 		applySampler(t);
 		return id;
 	}
@@ -847,10 +974,23 @@ final class Gfx
 		if (!vulkan) { GLES20.glDeleteTextures(n, ids, offset); return; }
 		for (int i = 0; i < n; ++i)
 		{
-			VkTex t = textures.remove(ids[offset + i]);
-			if (t != null && t.owned && t.image != 0) Vk.imageDestroy(t.image);
+			int id = ids[offset + i];
+			VkTex t = getTex(id);
+			if (t != null)
+			{
+				textures[id] = null;
+				if (freeTexTop == freeTexIds.length) freeTexIds = Arrays.copyOf(freeTexIds, freeTexIds.length << 1);
+				freeTexIds[freeTexTop++] = id;
+				if (t.owned && t.image != 0) Vk.imageDestroy(t.image);
+			}
 			for (int u = 0; u < unitTextures.length; ++u)
-				if (unitTextures[u] == ids[offset + i]) unitTextures[u] = 0;
+			{
+				if (unitTextures[u] == id)
+				{
+					unitTextures[u] = 0;
+					unitTexturesDirty = true;
+				}
+			}
 		}
 	}
 
@@ -862,12 +1002,16 @@ final class Gfx
 	static void glBindTexture(int target, int id)
 	{
 		if (!vulkan) { GLES20.glBindTexture(target, id); return; }
-		if (activeUnit >= 0 && activeUnit < unitTextures.length) unitTextures[activeUnit] = id;
+		if (activeUnit >= 0 && activeUnit < unitTextures.length && unitTextures[activeUnit] != id)
+		{
+			unitTextures[activeUnit] = id;
+			unitTexturesDirty = true;
+		}
 	}
 
 	private static VkTex bound()
 	{
-		return activeUnit >= 0 && activeUnit < unitTextures.length ? textures.get(unitTextures[activeUnit]) : null;
+		return activeUnit >= 0 && activeUnit < unitTextures.length ? getTex(unitTextures[activeUnit]) : null;
 	}
 
 	private static void applySampler(VkTex t)
@@ -896,6 +1040,7 @@ final class Gfx
 		applySampler(t);
 		if (pixels != null) Vk.imageUpload(t.image, 0, 0, 0, 0, width, height, 1, pixels, 1);
 		emittedUnitImages[activeUnit] = -1;
+		unitTexturesDirty = true;
 	}
 
 	static void glTexStorage3D(int target, int levels, int internalFormat, int width, int height, int depth)
@@ -913,6 +1058,7 @@ final class Gfx
 		t.levels = levels;
 		applySampler(t);
 		emittedUnitImages[activeUnit] = -1;
+		unitTexturesDirty = true;
 	}
 
 	static void glTexSubImage2D(int target, int level, int x, int y, int width, int height, int format, int type, Buffer pixels)
@@ -972,6 +1118,15 @@ final class Gfx
 	// Draws
 	// ---------------------------------------------------------------------------------------
 
+	static void uploadInterfacePixels(int textureId, int width, int height, int[] pixels)
+	{
+		if (!vulkan) return;
+		VkTex t = getTex(textureId);
+		if (t == null || t.image == 0) return;
+		endPass();
+		Vk.imageUpload(t.image, 0, 0, 0, 0, width, height, pixels, 0, width * height);
+	}
+
 	/** Everything a draw needs that GL keeps as bound state. */
 	private static void prepareDraw()
 	{
@@ -987,17 +1142,25 @@ final class Gfx
 				m.put(src);
 				p.blockDirty = false;
 			}
-			Vk.bindUniformBuffer(LOOSE_BLOCK_BINDING, p.blockBuffer);
-		}
-		for (int unit = 0; unit < unitTextures.length; ++unit)
-		{
-			VkTex t = textures.get(unitTextures[unit]);
-			int image = t != null ? t.image : 0;
-			if (emittedUnitImages[unit] != image)
+			if (boundLooseBlockBuffer != p.blockBuffer)
 			{
-				Vk.bindTexture(unit, image);
-				emittedUnitImages[unit] = image;
+				Vk.bindUniformBuffer(LOOSE_BLOCK_BINDING, p.blockBuffer);
+				boundLooseBlockBuffer = p.blockBuffer;
 			}
+		}
+		if (unitTexturesDirty)
+		{
+			for (int unit = 0; unit < unitTextures.length; ++unit)
+			{
+				VkTex t = getTex(unitTextures[unit]);
+				int image = t != null ? t.image : 0;
+				if (emittedUnitImages[unit] != image)
+				{
+					Vk.bindTexture(unit, image);
+					emittedUnitImages[unit] = image;
+				}
+			}
+			unitTexturesDirty = false;
 		}
 	}
 
@@ -1019,13 +1182,11 @@ final class Gfx
 			for (int i = 0; i < n; ++i) GLES20.glDrawArrays(mode, firsts.get(i), counts.get(i));
 			return;
 		}
-		if (counts.limit() <= 0) return;
+		int n = counts.limit();
+		if (n <= 0) return;
 		prepareDraw();
 		Vk.bindVertexLayout(boundVao, 0);
-		IntBuffer f = firsts.duplicate(), c = counts.duplicate();
-		f.position(0);
-		c.position(0);
-		Vk.multiDrawArrays(f, c);
+		Vk.multiDrawArrays(firsts, counts, n);
 	}
 
 	static void glDrawElements(int mode, int count, int type, int offset)
@@ -1037,7 +1198,7 @@ final class Gfx
 		elementOverride = 0;
 		if (ebo == 0)
 		{
-			VkBuf b = buffers.get(boundElementBuffer);
+			VkBuf b = getBuf(boundElementBuffer);
 			ebo = b != null ? b.handle : 0;
 		}
 		Vk.bindVertexLayout(boundVao, ebo);

@@ -315,6 +315,13 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 	 *  of LOS each cycle. Keep one buffer per canvas size, reuse forever. */
 	private ByteBuffer interfaceUploadBuf;
 	private IntBuffer interfaceUploadBufAsInts;
+	private int[] glesInterfaceShadow;
+	private static final int UI_MAX_DIRTY_BANDS = 16;
+	private static final int UI_DIRTY_MERGE_GAP = 32;
+	private final int[] glesDirtyStarts = new int[UI_MAX_DIRTY_BANDS];
+	private final int[] glesDirtyEnds = new int[UI_MAX_DIRTY_BANDS];
+	private final float[] worldProjScratch = new float[16];
+	private final float[] tmpMatScratch = new float[16];
 
 	private final GlesBuffer glUniformBuffer = new GlesBuffer("uniform buffer");
 
@@ -877,6 +884,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		sceneFbo = sceneResolveFbo = sceneColorTex = sceneColorRbo = sceneDepthRbo = 0;
 		sceneFboW = sceneFboH = 0;
 		sceneSamples = 0;
+		glesInterfaceShadow = null;
 
 		// Static-scene geometry lives in per-zone VBOs/VAOs that are now invalid. Mark
 		// every zone dirty so it re-uploads into fresh buffers on the next rebuild.
@@ -1086,6 +1094,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		// A new texture has no storage yet; make prepareInterfaceTexture allocate it even when
 		// the canvas is the size it was before (a renderer restart, e.g. switching to Vulkan)
 		lastCanvasWidth = lastCanvasHeight = -1;
+		glesInterfaceShadow = null;
 		glBindTexture(GL_TEXTURE_2D, interfaceTexture);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1099,6 +1108,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		if (interfacePbo != 0)     glDeleteBuffers(1, new int[]{ interfacePbo }, 0);
 		if (interfaceTexture != 0) glDeleteTextures(1, new int[]{ interfaceTexture }, 0);
 		interfacePbo = interfaceTexture = 0;
+		glesInterfaceShadow = null;
 	}
 
 	/**
@@ -1297,6 +1307,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		sceneFbo = sceneResolveFbo = sceneColorTex = sceneColorRbo = sceneDepthRbo = 0;
 		sceneFboW = sceneFboH = 0;
 		sceneSamples = 0;
+		glesInterfaceShadow = null;
 	}
 
 	// -----------------------------------------------------------------------
@@ -1845,11 +1856,17 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		}
 
 		// World projection matrix (column-major, glUniformMatrix4fv pushes as-is).
-		float[] proj = Mat4.scale(client.getScale(), client.getScale(), 1);
-		Mat4.mul(proj, Mat4.projection(viewportWidth, viewportHeight, 50));
-		Mat4.mul(proj, Mat4.rotateX(cameraPitch));
-		Mat4.mul(proj, Mat4.rotateY(cameraYaw));
-		Mat4.mul(proj, Mat4.translate(-cameraX, -cameraY, -cameraZ));
+		float[] proj = worldProjScratch;
+		float[] tmpMat = tmpMatScratch;
+		Mat4.setScale(proj, client.getScale(), client.getScale(), 1);
+		Mat4.setProjection(tmpMat, viewportWidth, viewportHeight, 50);
+		Mat4.mul(proj, tmpMat);
+		Mat4.setRotateX(tmpMat, cameraPitch);
+		Mat4.mul(proj, tmpMat);
+		Mat4.setRotateY(tmpMat, cameraYaw);
+		Mat4.mul(proj, tmpMat);
+		Mat4.setTranslate(tmpMat, -cameraX, -cameraY, -cameraZ);
+		Mat4.mul(proj, tmpMat);
 		glUniformMatrix4fv(uniWorldProj, 1, false, proj, 0);
 
 		glUniformMatrix4fv(uniEntityProj, 1, false, IDENTITY, 0);
@@ -2278,6 +2295,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		{
 			lastCanvasWidth = canvasWidth;
 			lastCanvasHeight = canvasHeight;
+			glesInterfaceShadow = null;
 			glBindTexture(GL_TEXTURE_2D, interfaceTexture);
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, canvasWidth, canvasHeight, 0,
 				GL_RGBA, GL_UNSIGNED_BYTE, null);
@@ -2291,6 +2309,14 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		int h = bp.getHeight();
 		if (pixels == null || w <= 0 || h <= 0) return;
 
+		if (Gfx.vulkan)
+		{
+			// Vulkan streams directly from the Java int[] shadow/staging path without allocating
+			// or filling an intermediate 4 MB Java ByteBuffer.
+			Gfx.uploadInterfacePixels(interfaceTexture, w, h, pixels);
+			return;
+		}
+
 		// Reuse a per-canvas-size direct ByteBuffer for the pixel upload. Allocating one
 		// every frame was producing ~3.7MB of LOS garbage per frame at 1280×720, which
 		// under Unlock FPS = constant 185ms blocking-GC pauses (see logcat:
@@ -2298,18 +2324,95 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		// followed by "WaitForGcToComplete blocked Alloc on Background for 121ms").
 		// The IntBuffer view is also cached because asIntBuffer() returns a fresh wrapper
 		// each call and that was an even smaller but still per-frame allocation.
-		int needBytes = w * h * 4;
+		int needInts = w * h;
+		int needBytes = needInts * 4;
 		if (interfaceUploadBuf == null || interfaceUploadBuf.capacity() < needBytes)
 		{
 			interfaceUploadBuf = ByteBuffer.allocateDirect(needBytes).order(ByteOrder.nativeOrder());
 			interfaceUploadBufAsInts = interfaceUploadBuf.asIntBuffer();
 		}
-		interfaceUploadBufAsInts.clear();
-		interfaceUploadBufAsInts.put(pixels, 0, w * h);
-		interfaceUploadBuf.position(0).limit(needBytes);
+
+		if (w != canvasWidth || h != canvasHeight)
+		{
+			glesInterfaceShadow = null;
+			interfaceUploadBufAsInts.clear();
+			interfaceUploadBufAsInts.put(pixels, 0, needInts);
+			interfaceUploadBuf.position(0).limit(needBytes);
+			glBindTexture(GL_TEXTURE_2D, interfaceTexture);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, interfaceUploadBuf);
+			glBindTexture(GL_TEXTURE_2D, 0);
+			return;
+		}
+
+		if (glesInterfaceShadow == null || glesInterfaceShadow.length != needInts)
+		{
+			glesInterfaceShadow = new int[needInts];
+			System.arraycopy(pixels, 0, glesInterfaceShadow, 0, needInts);
+			interfaceUploadBufAsInts.clear();
+			interfaceUploadBufAsInts.put(pixels, 0, needInts);
+			interfaceUploadBuf.position(0).limit(needBytes);
+			glBindTexture(GL_TEXTURE_2D, interfaceTexture);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, interfaceUploadBuf);
+			glBindTexture(GL_TEXTURE_2D, 0);
+			return;
+		}
+
+		int bandCount = collectDirtyBands(pixels, glesInterfaceShadow, w, h, glesDirtyStarts, glesDirtyEnds);
+		if (bandCount == 0) return;
+
 		glBindTexture(GL_TEXTURE_2D, interfaceTexture);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, interfaceUploadBuf);
+		for (int i = 0; i < bandCount; ++i)
+		{
+			int y0 = glesDirtyStarts[i];
+			int bh = glesDirtyEnds[i] - y0;
+			int off = y0 * w;
+			int count = bh * w;
+			System.arraycopy(pixels, off, glesInterfaceShadow, off, count);
+			interfaceUploadBufAsInts.clear();
+			interfaceUploadBufAsInts.put(pixels, off, count);
+			interfaceUploadBuf.position(0).limit(count * 4);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y0, w, bh, GL_RGBA, GL_UNSIGNED_BYTE, interfaceUploadBuf);
+		}
 		glBindTexture(GL_TEXTURE_2D, 0);
+	}
+
+	/** Package-private for host tests: groups changed pixel rows into at most UI_MAX_DIRTY_BANDS spans. */
+	static int collectDirtyBands(int[] pixels, int[] shadow, int w, int h, int[] starts, int[] ends)
+	{
+		int bandCount = 0;
+		for (int y = 0; y < h; ++y)
+		{
+			int off = y * w;
+			if (rowsDiffer(pixels, shadow, off, w))
+			{
+				if (bandCount == 0)
+				{
+					starts[0] = y;
+					ends[0] = y + 1;
+					bandCount = 1;
+				}
+				else if (y - ends[bandCount - 1] < UI_DIRTY_MERGE_GAP || bandCount == UI_MAX_DIRTY_BANDS)
+				{
+					ends[bandCount - 1] = y + 1;
+				}
+				else
+				{
+					starts[bandCount] = y;
+					ends[bandCount] = y + 1;
+					bandCount++;
+				}
+			}
+		}
+		return bandCount;
+	}
+
+	private static boolean rowsDiffer(int[] a, int[] b, int off, int len)
+	{
+		for (int i = 0; i < len; ++i)
+		{
+			if (a[off + i] != b[off + i]) return true;
+		}
+		return false;
 	}
 
 	/**

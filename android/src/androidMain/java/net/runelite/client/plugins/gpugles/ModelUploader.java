@@ -72,6 +72,10 @@ class ModelUploader
 	private final int[][] orderedFaces;
 
 	private final int[] vertexBuffer;
+	private static final int BATCH_FACES = 64;
+	private final int[] opaqueBatch = new int[FACE_SIZE * BATCH_FACES];
+	private final int[] alphaBatch = new int[FACE_SIZE * BATCH_FACES];
+	private int opaqueBatchOff, alphaBatchOff;
 
 	private final float[] u, v;
 
@@ -146,6 +150,10 @@ class ModelUploader
 		final byte[] faceRenderPriorities = model.getFaceRenderPriorities();
 
 		final short[] faceTextures = model.getFaceTextures();
+		final byte[] textureFaces = model.getTextureFaces();
+		final int[] texIndices1 = textureFaces != null ? model.getTexIndices1() : null;
+		final int[] texIndices2 = textureFaces != null ? model.getTexIndices2() : null;
+		final int[] texIndices3 = textureFaces != null ? model.getTexIndices3() : null;
 
 		final byte[] transparencies = model.getFaceTransparencies();
 		final byte modelTransparency = model.getTransparency();
@@ -263,16 +271,24 @@ class ModelUploader
 					minFz = Math.min(minFz, distance);
 					maxFz = Math.max(maxFz, distance);
 
-					computeFaceUvs(model, faceIdx, u, v);
-
-					int su0 = (int) (u[0] * 256f);
-					int sv0 = (int) (v[0] * 256f);
-
-					int su1 = (int) (u[1] * 256f);
-					int sv1 = (int) (v[1] * 256f);
-
-					int su2 = (int) (u[2] * 256f);
-					int sv2 = (int) (v[2] * 256f);
+					int su0, sv0, su1, sv1, su2, sv2;
+					if (textureFaces == null || textureFaces[faceIdx] == -1)
+					{
+						su0 = 0; sv0 = 0;
+						su1 = 256; sv1 = 0;
+						su2 = 0; sv2 = 256;
+					}
+					else
+					{
+						computeFaceUvsFast(verticesX, verticesY, verticesZ, indices1, indices2, indices3,
+							textureFaces, texIndices1, texIndices2, texIndices3, faceIdx, u, v);
+						su0 = (int) (u[0] * 256f);
+						sv0 = (int) (v[0] * 256f);
+						su1 = (int) (u[1] * 256f);
+						sv1 = (int) (v[1] * 256f);
+						su2 = (int) (u[2] * 256f);
+						sv2 = (int) (v[2] * 256f);
+					}
 
 					int color1 = faceColors1[faceIdx];
 					int color2 = faceColors2[faceIdx];
@@ -335,15 +351,15 @@ class ModelUploader
 		}
 
 		int len = 0;
+		opaqueBatchOff = 0;
+		alphaBatchOff = 0;
 		if (faceRenderPriorities == null || !prioritySort)
 		{
 			for (int i = maxFz; i >= minFz; --i)
 			{
 				for (char face = zsortHead[i]; face != (char) -1; face = zsortNext[face])
 				{
-					int offset = face * FACE_SIZE;
-					var b = (vertexBuffer[offset + 3] & 0xff000000) != 0 ? alphaBuffer : opaqueBuffer;
-					b.put(vertexBuffer, offset, FACE_SIZE);
+					appendFace(face * FACE_SIZE, opaqueBuffer, alphaBuffer);
 				}
 			}
 		}
@@ -420,9 +436,7 @@ class ModelUploader
 				while (pri == 0 && currFaceDistance > avg12)
 				{
 					final int face = dynFaces[drawnFaces++];
-					int offset = face * FACE_SIZE;
-					var b = (vertexBuffer[offset + 3] & 0xff000000) != 0 ? alphaBuffer : opaqueBuffer;
-					b.put(vertexBuffer, offset, FACE_SIZE);
+					appendFace(face * FACE_SIZE, opaqueBuffer, alphaBuffer);
 
 					if (drawnFaces == numDynFaces && dynFaces != orderedFaces[11])
 					{
@@ -445,9 +459,7 @@ class ModelUploader
 				while (pri == 3 && currFaceDistance > avg34)
 				{
 					final int face = dynFaces[drawnFaces++];
-					int offset = face * FACE_SIZE;
-					var b = (vertexBuffer[offset + 3] & 0xff000000) != 0 ? alphaBuffer : opaqueBuffer;
-					b.put(vertexBuffer, offset, FACE_SIZE);
+					appendFace(face * FACE_SIZE, opaqueBuffer, alphaBuffer);
 
 					if (drawnFaces == numDynFaces && dynFaces != orderedFaces[11])
 					{
@@ -470,9 +482,7 @@ class ModelUploader
 				while (pri == 5 && currFaceDistance > avg68)
 				{
 					final int face = dynFaces[drawnFaces++];
-					int offset = face * FACE_SIZE;
-					var b = (vertexBuffer[offset + 3] & 0xff000000) != 0 ? alphaBuffer : opaqueBuffer;
-					b.put(vertexBuffer, offset, FACE_SIZE);
+					appendFace(face * FACE_SIZE, opaqueBuffer, alphaBuffer);
 
 					if (drawnFaces == numDynFaces && dynFaces != orderedFaces[11])
 					{
@@ -497,19 +507,14 @@ class ModelUploader
 
 				for (int faceIdx = 0; faceIdx < priNum; ++faceIdx)
 				{
-					final int face = priFaces[faceIdx];
-					int offset = face * FACE_SIZE;
-					var b = (vertexBuffer[offset + 3] & 0xff000000) != 0 ? alphaBuffer : opaqueBuffer;
-					b.put(vertexBuffer, offset, FACE_SIZE);
+					appendFace(priFaces[faceIdx] * FACE_SIZE, opaqueBuffer, alphaBuffer);
 				}
 			}
 
 			while (currFaceDistance != -1000)
 			{
 				final int face = dynFaces[drawnFaces++];
-				int offset = face * FACE_SIZE;
-				var b = (vertexBuffer[offset + 3] & 0xff000000) != 0 ? alphaBuffer : opaqueBuffer;
-				b.put(vertexBuffer, offset, FACE_SIZE);
+				appendFace(face * FACE_SIZE, opaqueBuffer, alphaBuffer);
 
 				if (drawnFaces == numDynFaces && dynFaces != orderedFaces[11])
 				{
@@ -529,8 +534,47 @@ class ModelUploader
 				}
 			}
 		}
+		flushBatches(opaqueBuffer, alphaBuffer);
 
 		return len;
+	}
+
+	private void appendFace(int offset, IntBuffer opaqueBuffer, IntBuffer alphaBuffer)
+	{
+		if ((vertexBuffer[offset + 3] & 0xff000000) != 0)
+		{
+			if (alphaBatchOff + FACE_SIZE > alphaBatch.length)
+			{
+				alphaBuffer.put(alphaBatch, 0, alphaBatchOff);
+				alphaBatchOff = 0;
+			}
+			System.arraycopy(vertexBuffer, offset, alphaBatch, alphaBatchOff, FACE_SIZE);
+			alphaBatchOff += FACE_SIZE;
+		}
+		else
+		{
+			if (opaqueBatchOff + FACE_SIZE > opaqueBatch.length)
+			{
+				opaqueBuffer.put(opaqueBatch, 0, opaqueBatchOff);
+				opaqueBatchOff = 0;
+			}
+			System.arraycopy(vertexBuffer, offset, opaqueBatch, opaqueBatchOff, FACE_SIZE);
+			opaqueBatchOff += FACE_SIZE;
+		}
+	}
+
+	private void flushBatches(IntBuffer opaqueBuffer, IntBuffer alphaBuffer)
+	{
+		if (opaqueBatchOff > 0)
+		{
+			opaqueBuffer.put(opaqueBatch, 0, opaqueBatchOff);
+			opaqueBatchOff = 0;
+		}
+		if (alphaBatchOff > 0)
+		{
+			alphaBuffer.put(alphaBatch, 0, alphaBatchOff);
+			alphaBatchOff = 0;
+		}
 	}
 
 	/**
@@ -580,6 +624,10 @@ class ModelUploader
 		final byte[] transparencies = model.getFaceTransparencies();
 
 		final short[] faceTextures = model.getFaceTextures();
+		final byte[] textureFaces = model.getTextureFaces();
+		final int[] texIndices1 = textureFaces != null ? model.getTexIndices1() : null;
+		final int[] texIndices2 = textureFaces != null ? model.getTexIndices2() : null;
+		final int[] texIndices3 = textureFaces != null ? model.getTexIndices3() : null;
 
 		final byte[] bias = model.getFaceBias();
 
@@ -619,6 +667,7 @@ class ModelUploader
 		}
 
 		int len = 0;
+		int vOff = 0;
 		for (int face = 0; face < triangleCount; ++face)
 		{
 			int color1 = color1s[face];
@@ -661,32 +710,63 @@ class ModelUploader
 			float vy3 = modelLocalY[triangleC];
 			float vz3 = modelLocalZ[triangleC];
 
-			computeFaceUvs(model, face, u, v);
-
-			int su0 = (int) (u[0] * 256f);
-			int sv0 = (int) (v[0] * 256f);
-
-			int su1 = (int) (u[1] * 256f);
-			int sv1 = (int) (v[1] * 256f);
-
-			int su2 = (int) (u[2] * 256f);
-			int sv2 = (int) (v[2] * 256f);
+			int su0, sv0, su1, sv1, su2, sv2;
+			if (textureFaces == null || textureFaces[face] == -1)
+			{
+				su0 = 0; sv0 = 0;
+				su1 = 256; sv1 = 0;
+				su2 = 0; sv2 = 256;
+			}
+			else
+			{
+				computeFaceUvsFast(verticesX, verticesY, verticesZ, indices1, indices2, indices3,
+					textureFaces, texIndices1, texIndices2, texIndices3, face, u, v);
+				su0 = (int) (u[0] * 256f);
+				sv0 = (int) (v[0] * 256f);
+				su1 = (int) (u[1] * 256f);
+				sv1 = (int) (v[1] * 256f);
+				su2 = (int) (u[2] * 256f);
+				sv2 = (int) (v[2] * 256f);
+			}
 
 			int alphaBias = 0;
 			alphaBias |= transparencies != null ? (transparencies[face] & 0xff) << 24 : 0;
 			alphaBias |= bias != null ? (bias[face] & 0xff) << 16 : 0;
 			int texture = faceTextures != null ? faceTextures[face] + 1 : 0;
 
-			putfff4(buffer, vx1, vy1, vz1, alphaBias | color1);
-			put2222(buffer, texture, su0, sv0, 0);
+			if (vOff + FACE_SIZE > vertexBuffer.length)
+			{
+				buffer.put(vertexBuffer, 0, vOff);
+				vOff = 0;
+			}
 
-			putfff4(buffer, vx2, vy2, vz2, alphaBias | color2);
-			put2222(buffer, texture, su1, sv1, 0);
+			int texBits = texture & 0xffff;
+			vertexBuffer[vOff++] = Float.floatToIntBits(vx1);
+			vertexBuffer[vOff++] = Float.floatToIntBits(vy1);
+			vertexBuffer[vOff++] = Float.floatToIntBits(vz1);
+			vertexBuffer[vOff++] = alphaBias | color1;
+			vertexBuffer[vOff++] = ((su0 & 0xffff) << 16) | texBits;
+			vertexBuffer[vOff++] = sv0 & 0xffff;
 
-			putfff4(buffer, vx3, vy3, vz3, alphaBias | color3);
-			put2222(buffer, texture, su2, sv2, 0);
+			vertexBuffer[vOff++] = Float.floatToIntBits(vx2);
+			vertexBuffer[vOff++] = Float.floatToIntBits(vy2);
+			vertexBuffer[vOff++] = Float.floatToIntBits(vz2);
+			vertexBuffer[vOff++] = alphaBias | color2;
+			vertexBuffer[vOff++] = ((su1 & 0xffff) << 16) | texBits;
+			vertexBuffer[vOff++] = sv1 & 0xffff;
+
+			vertexBuffer[vOff++] = Float.floatToIntBits(vx3);
+			vertexBuffer[vOff++] = Float.floatToIntBits(vy3);
+			vertexBuffer[vOff++] = Float.floatToIntBits(vz3);
+			vertexBuffer[vOff++] = alphaBias | color3;
+			vertexBuffer[vOff++] = ((su2 & 0xffff) << 16) | texBits;
+			vertexBuffer[vOff++] = sv2 & 0xffff;
 
 			len += 3;
+		}
+		if (vOff > 0)
+		{
+			buffer.put(vertexBuffer, 0, vOff);
 		}
 
 		return len;
@@ -732,19 +812,29 @@ class ModelUploader
 
 	static void computeFaceUvs(Model model, int face, float[] u, float[] v)
 	{
-		final float[] vertexX = model.getVerticesX();
-		final float[] vertexY = model.getVerticesY();
-		final float[] vertexZ = model.getVerticesZ();
-
-		final int[] indices1 = model.getFaceIndices1();
-		final int[] indices2 = model.getFaceIndices2();
-		final int[] indices3 = model.getFaceIndices3();
-
 		final byte[] textureFaces = model.getTextureFaces();
-		final int[] texIndices1 = model.getTexIndices1();
-		final int[] texIndices2 = model.getTexIndices2();
-		final int[] texIndices3 = model.getTexIndices3();
+		if (textureFaces == null || textureFaces[face] == -1)
+		{
+			u[0] = 0f;
+			v[0] = 0f;
+			u[1] = 1f;
+			v[1] = 0f;
+			u[2] = 0f;
+			v[2] = 1f;
+			return;
+		}
+		computeFaceUvsFast(model.getVerticesX(), model.getVerticesY(), model.getVerticesZ(),
+			model.getFaceIndices1(), model.getFaceIndices2(), model.getFaceIndices3(),
+			textureFaces, model.getTexIndices1(), model.getTexIndices2(), model.getTexIndices3(),
+			face, u, v);
+	}
 
+	private static void computeFaceUvsFast(
+		float[] vertexX, float[] vertexY, float[] vertexZ,
+		int[] indices1, int[] indices2, int[] indices3,
+		byte[] textureFaces, int[] texIndices1, int[] texIndices2, int[] texIndices3,
+		int face, float[] u, float[] v)
+	{
 		if (textureFaces != null && textureFaces[face] != -1)
 		{
 			final int triangleA = indices1[face];

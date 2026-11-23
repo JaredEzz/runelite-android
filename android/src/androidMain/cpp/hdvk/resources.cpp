@@ -369,20 +369,47 @@ Image *imageUse(int handle) {
 	return img;
 }
 
-bool imageUpload(int handle, uint32_t level, int x, int y, int layer, uint32_t w, uint32_t h, uint32_t layerCount,
-	const void *data, size_t size, int srcBuffer, VkDeviceSize srcOffset, int formatHint) {
+static Image *validateImageUpload(int handle, uint32_t level, int x, int y, uint32_t w, uint32_t h,
+	uint32_t &layerCount, VkDeviceSize &bytes) {
 	Image *img = imageUse(handle);
-	if (!img || w == 0 || h == 0) return false;
-	if (ctx->inPass) endPass();
+	if (!img || w == 0 || h == 0) return nullptr;
 	layerCount = std::max<uint32_t>(layerCount, 1);
 	uint32_t mw = std::max<uint32_t>(img->width >> level, 1), mh = std::max<uint32_t>(img->height >> level, 1);
 	if (x < 0 || y < 0 || x + w > mw || y + h > mh) {
 		// Out-of-bounds copies are undefined in Vulkan (drivers may drop them); GL errors instead
 		LOGE("imageUpload %d: %ux%u at %d,%d exceeds %ux%u", handle, w, h, x, y, mw, mh);
-		return false;
+		return nullptr;
 	}
+	bytes = (VkDeviceSize) w * h * layerCount * bytesPerPixel(img->format);
+	return img;
+}
 
-	VkDeviceSize bytes = (VkDeviceSize) w * h * layerCount * bytesPerPixel(img->format);
+static void recordImageCopyRegions(Image *img, uint32_t level, int layer, uint32_t layerCount,
+	VkBuffer src, const VkBufferImageCopy *regions, uint32_t regionCount) {
+	VkCommandBuffer cb = cmd();
+	VkImageLayout resting = img->layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : img->layout;
+	bool general = resting == VK_IMAGE_LAYOUT_GENERAL;
+	uint32_t baseLayer = img->type == IMG_3D ? 0 : (uint32_t) layer;
+	uint32_t layers = img->type == IMG_3D ? 1 : layerCount;
+	if (!general)
+		imageBarrier(cb, img, img->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, baseLayer, layers, level, 1);
+
+	vkCmdCopyBufferToImage(cb, src, img->image, general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		regionCount, regions);
+
+	if (!general)
+		imageBarrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, resting, baseLayer, layers, level, 1);
+	img->layout = resting;
+}
+
+bool imageUpload(int handle, uint32_t level, int x, int y, int layer, uint32_t w, uint32_t h, uint32_t layerCount,
+	const void *data, size_t size, int srcBuffer, VkDeviceSize srcOffset, int formatHint) {
+	VkDeviceSize bytes = 0;
+	Image *img = validateImageUpload(handle, level, x, y, w, h, layerCount, bytes);
+	if (!img) return false;
+	if (ctx->inPass) endPass();
+	img->shadowW = img->shadowH = 0;
+
 	VkBuffer src = VK_NULL_HANDLE;
 	VkDeviceSize offset = 0;
 	if (srcBuffer) {
@@ -400,24 +427,135 @@ bool imageUpload(int handle, uint32_t level, int x, int y, int layer, uint32_t w
 		memcpy(mapped, data, (size_t) bytes);
 	}
 
-	VkCommandBuffer cb = cmd();
-	VkImageLayout resting = img->layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : img->layout;
-	bool general = resting == VK_IMAGE_LAYOUT_GENERAL;
 	uint32_t baseLayer = img->type == IMG_3D ? 0 : (uint32_t) layer;
 	uint32_t layers = img->type == IMG_3D ? 1 : layerCount;
-	if (!general)
-		imageBarrier(cb, img, img->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, baseLayer, layers, level, 1);
-
 	VkBufferImageCopy region{};
 	region.bufferOffset = offset;
 	region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, baseLayer, layers };
 	region.imageOffset = { x, y, img->type == IMG_3D ? layer : 0 };
 	region.imageExtent = { w, h, img->type == IMG_3D ? layerCount : 1 };
-	vkCmdCopyBufferToImage(cb, src, img->image, general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	recordImageCopyRegions(img, level, layer, layerCount, src, &region, 1);
+	return true;
+}
 
-	if (!general)
-		imageBarrier(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, resting, baseLayer, layers, level, 1);
-	img->layout = resting;
+bool imageUploadInts(JNIEnv *env, int handle, uint32_t level, int x, int y, int layer,
+	uint32_t w, uint32_t h, uint32_t layerCount, jintArray data, jint offsetInts, jint countInts) {
+	if (!data || offsetInts < 0 || countInts < 0) return false;
+	VkDeviceSize bytes = 0;
+	Image *img = validateImageUpload(handle, level, x, y, w, h, layerCount, bytes);
+	if (!img) return false;
+	if ((bytes & 3) != 0 || (uint64_t) (uint32_t) countInts * 4ull < bytes) {
+		LOGE("imageUploadInts: %d ints provided, %llu bytes needed", countInts, (unsigned long long) bytes);
+		return false;
+	}
+	jsize needInts = (jsize) (bytes / 4);
+	if ((int64_t) offsetInts + (int64_t) needInts > (int64_t) env->GetArrayLength(data)) {
+		LOGE("imageUploadInts: slice (%d + %d) exceeds array length", offsetInts, needInts);
+		return false;
+	}
+
+	// Fast dirty-band path for repeated full-frame 2D RGBA uploads (e.g., interface UI texture).
+	if (level == 0 && x == 0 && y == 0 && w == img->width && h == img->height
+		&& layerCount == 1 && img->type == IMG_2D && bytesPerPixel(img->format) == 4) {
+		struct RowBand { uint32_t y0, y1; };
+		constexpr int MAX_BANDS = 16;
+		constexpr uint32_t MERGE_GAP = 32;
+		RowBand bands[MAX_BANDS];
+		int bandCount = 0;
+
+		bool fullUpload = img->shadowW != w || img->shadowH != h || img->shadowPixels.size() != (size_t) needInts;
+		if (fullUpload) img->shadowPixels.resize((size_t) needInts);
+
+		void *raw = env->GetPrimitiveArrayCritical(data, nullptr);
+		if (raw) {
+			const int32_t *srcInts = (const int32_t *) raw + offsetInts;
+			if (fullUpload) {
+				memcpy(img->shadowPixels.data(), srcInts, (size_t) bytes);
+				bands[0] = { 0, h };
+				bandCount = 1;
+			} else {
+				const size_t rowBytes = (size_t) w * 4;
+				int32_t *shadow = img->shadowPixels.data();
+				for (uint32_t row = 0; row < h; ++row) {
+					size_t off = (size_t) row * w;
+					if (memcmp(srcInts + off, shadow + off, rowBytes) != 0) {
+						if (bandCount == 0) {
+							bands[bandCount++] = { row, row + 1 };
+						} else if (row - bands[bandCount - 1].y1 < MERGE_GAP || bandCount == MAX_BANDS) {
+							bands[bandCount - 1].y1 = row + 1;
+						} else {
+							bands[bandCount++] = { row, row + 1 };
+						}
+					}
+				}
+				for (int b = 0; b < bandCount; ++b) {
+					size_t off = (size_t) bands[b].y0 * w;
+					size_t bBytes = (size_t) (bands[b].y1 - bands[b].y0) * rowBytes;
+					memcpy(shadow + off, srcInts + off, bBytes);
+				}
+			}
+			env->ReleasePrimitiveArrayCritical(data, raw, JNI_ABORT);
+			if (fullUpload) {
+				img->shadowW = w;
+				img->shadowH = h;
+			}
+			if (bandCount == 0) return true;
+
+			if (ctx->inPass) endPass();
+			VkDeviceSize totalBytes = 0;
+			const VkDeviceSize rowBytes = (VkDeviceSize) w * 4;
+			for (int b = 0; b < bandCount; ++b) {
+				VkDeviceSize bBytes = (VkDeviceSize) (bands[b].y1 - bands[b].y0) * rowBytes;
+				totalBytes += (bBytes + 15) & ~(VkDeviceSize) 15;
+			}
+			VkBuffer src = VK_NULL_HANDLE;
+			VkDeviceSize offset = 0;
+			void *mapped = nullptr;
+			if (!stagingAlloc(totalBytes, 16, src, offset, mapped)) {
+				img->shadowW = img->shadowH = 0;
+				return false;
+			}
+
+			VkBufferImageCopy regions[MAX_BANDS]{};
+			VkDeviceSize mappedPos = 0;
+			const uint32_t baseLayer = (uint32_t) layer;
+			const int32_t *shadow = img->shadowPixels.data();
+			for (int b = 0; b < bandCount; ++b) {
+				uint32_t y0 = bands[b].y0;
+				uint32_t bh = bands[b].y1 - y0;
+				VkDeviceSize bBytes = (VkDeviceSize) bh * rowBytes;
+				memcpy((char *) mapped + mappedPos, shadow + (size_t) y0 * w, (size_t) bBytes);
+				regions[b].bufferOffset = offset + mappedPos;
+				regions[b].imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, baseLayer, 1 };
+				regions[b].imageOffset = { 0, (int32_t) y0, 0 };
+				regions[b].imageExtent = { w, bh, 1 };
+				mappedPos += (bBytes + 15) & ~(VkDeviceSize) 15;
+			}
+			recordImageCopyRegions(img, 0, layer, 1, src, regions, (uint32_t) bandCount);
+			return true;
+		}
+	}
+
+	// Fallback / sub-rect path: invalidate shadow and copy straight into staging via GetIntArrayRegion.
+	img->shadowW = img->shadowH = 0;
+	if (ctx->inPass) endPass();
+	VkBuffer src = VK_NULL_HANDLE;
+	VkDeviceSize offset = 0;
+	void *mapped = nullptr;
+	if (!stagingAlloc(bytes, 16, src, offset, mapped)) return false;
+	env->GetIntArrayRegion(data, offsetInts, needInts, (jint *) mapped);
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		return false;
+	}
+	uint32_t baseLayer = img->type == IMG_3D ? 0 : (uint32_t) layer;
+	uint32_t layers = img->type == IMG_3D ? 1 : layerCount;
+	VkBufferImageCopy region{};
+	region.bufferOffset = offset;
+	region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, baseLayer, layers };
+	region.imageOffset = { x, y, img->type == IMG_3D ? layer : 0 };
+	region.imageExtent = { w, h, img->type == IMG_3D ? layerCount : 1 };
+	recordImageCopyRegions(img, level, layer, layerCount, src, &region, 1);
 	return true;
 }
 
