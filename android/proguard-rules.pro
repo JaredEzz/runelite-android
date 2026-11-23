@@ -69,6 +69,11 @@
 # JdkRetargets shims: the retargeted client and hub jars call them by name and descriptor.
 -keep class net.runelite.mp.compat.jdk.** { *; }
 
+# Build-time and runtime generated EventBus direct invokers (zero Method.invoke on ART).
+-keep interface net.runelite.client.eventbus.EventBus$ClassInvoker { *; }
+-keep class *$$EventInvoker { <init>(); }
+-keepclassmembers class * { synthetic void $rlsub$*(...); }
+
 # Downloaded hub plugins reach H2 through the parent loader after APK shrinking.
 -keep class org.h2.** { *; }
 # Optional paths inside the retained engine: JDBC 4.2 SQLType overloads, scripted
