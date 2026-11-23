@@ -52,7 +52,7 @@ internal object ClientPrepStatus
 internal object ClientPreparer
 {
     /** Bump whenever a transform or the packaging changes, so cached clients are rebuilt. */
-    private const val TRANSFORM_VERSION = "t2-${RuntimeDexConfiguration.CACHE_VERSION}"
+    private const val TRANSFORM_VERSION = "t3-${RuntimeDexConfiguration.CACHE_VERSION}"
     private const val REPO = "https://repo.runelite.net/net/runelite/injected-client"
 
     /** Prepares (or reuses) the client for [version] and makes it loadable. Blocking. */
@@ -151,7 +151,10 @@ internal object ClientPreparer
             }.run()
             step(4, "Rewriting unsupported Java APIs")
             val final = File(work, "5-final.jar")
-            DesugarApisTask().apply { inputJar = noLambda; outputJar = final }.run()
+            val unlocked = File(work, "5a-apis.jar")
+            DesugarApisTask().apply { inputJar = noLambda; outputJar = unlocked }.run()
+            // Last pre-D8 step: make synchronized regions verifiable so ART compiles those methods.
+            FixLockVerificationTask().apply { inputJar = unlocked; outputJar = final }.run()
             Log.i(TAG, "transforms done in ${(System.nanoTime() - started) / 1_000_000} ms")
 
             progress("Preparing game client for Android… (converting)")
