@@ -31,7 +31,25 @@ public class WildcardMatcher
 {
 	private static final Pattern WILDCARD_PATTERN = Pattern.compile("(?i)[^*]+|(\\*+)");
 
+	/** Compiled wildcard patterns; callers (NPC indicators, ground items) re-test the same few patterns per spawn/tick. */
+	private static final java.util.concurrent.ConcurrentHashMap<String, Pattern> COMPILED = new java.util.concurrent.ConcurrentHashMap<>();
+
 	public static boolean matches(String pattern, String text)
+	{
+		Pattern compiled = COMPILED.get(pattern);
+		if (compiled == null)
+		{
+			if (COMPILED.size() > 512)
+			{
+				COMPILED.clear();
+			}
+			compiled = Pattern.compile(toRegex(pattern));
+			COMPILED.put(pattern, compiled);
+		}
+		return compiled.matcher(text).matches();
+	}
+
+	private static String toRegex(String pattern)
 	{
 		final Matcher matcher = WILDCARD_PATTERN.matcher(pattern);
 		final StringBuilder buffer = new StringBuilder();
@@ -50,8 +68,6 @@ public class WildcardMatcher
 		}
 
 		matcher.appendTail(buffer);
-		final String replaced = buffer.toString();
-
-		return text.matches(replaced);
+		return buffer.toString();
 	}
 }

@@ -400,15 +400,29 @@ public class MobileInputPlugin extends Plugin
 		}
 	}
 
-    private static void collectDragItems(Widget w, List<Rectangle> items, double sx, double sy) {
-        if (w == null || w.isHidden()) return;
+    /** Draggable items (inventory/bank slots) under a scrollable layer; same linear walk as {@link #collect}. */
+    private void collectDragItems(Widget w, List<Rectangle> items, double sx, double sy) {
+        collectDragItems(w, false, items, sx, sy);
+    }
+
+    private void collectDragItems(Widget w, boolean dynamicChild, List<Rectangle> items, double sx, double sy) {
+        // Reached only through a visible widget (collect() checked the layer itself).
+        if (w == null || w.isSelfHidden()) return;
         if (w.getItemId() >= 0 || w.getDragParent() != null) {
             Rectangle b = w.getBounds();
             items.add(scaleRect(b.x, b.y, b.width, b.height, sx, sy));
         }
-        Widget[][] children = {w.getDynamicChildren(), w.getStaticChildren(), w.getNestedChildren()};
-        for (Widget[] group : children) if (group != null)
-            for (Widget child : group) collectDragItems(child, items, sx, sy);
+        final int id = w.getId();
+        Widget[] dyn = w.getChildren();
+        if (dyn != null)
+            for (Widget c : dyn) if (c != null && c.getParentId() == id) collectDragItems(c, true, items, sx, sy);
+        if (dynamicChild) return;
+        List<Widget> stat = staticChildren(id);
+        if (stat != null)
+            for (int i = 0, n = stat.size(); i < n; i++) collectDragItems(stat.get(i), false, items, sx, sy);
+        Widget[] nest = w.getNestedChildren();
+        if (nest != null)
+            for (Widget c : nest) collectDragItems(c, false, items, sx, sy);
     }
 
 	/** Most wide a scrollbar column gets; the game's are 16px. */
