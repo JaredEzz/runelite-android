@@ -33,6 +33,8 @@ import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.Point;
 import java.awt.Rectangle;
+import java.util.ArrayList;
+import java.util.List;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.Setter;
@@ -65,6 +67,8 @@ public class LineComponent implements LayoutableRenderableEntity
 	@Getter
 	private final Rectangle bounds = new Rectangle();
 
+	private final TextComponent textComponent = new TextComponent();
+
 	@Override
 	public Dimension render(Graphics2D graphics)
 	{
@@ -73,16 +77,29 @@ public class LineComponent implements LayoutableRenderableEntity
 		final String right = MoreObjects.firstNonNull(this.right, "");
 
 		final Font leftFont = MoreObjects.firstNonNull(this.leftFont, graphics.getFont());
-		final Font rightFont = MoreObjects.firstNonNull(this.rightFont, graphics.getFont());
-		final FontMetrics lfm = graphics.getFontMetrics(leftFont), rfm = graphics.getFontMetrics(rightFont);
-		final int fmHeight = Math.max(lfm.getHeight(), rfm.getHeight());
+		final FontMetrics lfm = graphics.getFontMetrics(leftFont);
+		final Font rightFont;
+		final FontMetrics rfm;
+		final int fmHeight;
+		if (!right.isEmpty() || this.rightFont != null)
+		{
+			rightFont = MoreObjects.firstNonNull(this.rightFont, graphics.getFont());
+			rfm = rightFont == leftFont ? lfm : graphics.getFontMetrics(rightFont);
+			fmHeight = Math.max(lfm.getHeight(), rfm.getHeight());
+		}
+		else
+		{
+			rightFont = leftFont;
+			rfm = lfm;
+			fmHeight = lfm.getHeight();
+		}
 		final int baseX = preferredLocation.x;
 		final int baseY = preferredLocation.y + fmHeight;
 		int x = baseX;
 		int y = baseY;
-		final int leftFullWidth = getLineWidth(left, lfm);
-		final int rightFullWidth = getLineWidth(right, rfm);
-		final TextComponent textComponent = new TextComponent();
+		final int leftFullWidth = left.isEmpty() ? 0 : getLineWidth(left, lfm);
+		final int rightFullWidth = right.isEmpty() ? 0 : getLineWidth(right, rfm);
+		final TextComponent textComponent = this.textComponent;
 
 		if (preferredSize.width < leftFullWidth + rightFullWidth)
 		{
@@ -164,7 +181,7 @@ public class LineComponent implements LayoutableRenderableEntity
 
 	private static String[] lineBreakText(String text, int maxWidth, FontMetrics metrics)
 	{
-		final String[] words = text.split(" ");
+		final String[] words = splitChar(text, ' ');
 
 		if (words.length == 0)
 		{
@@ -173,12 +190,12 @@ public class LineComponent implements LayoutableRenderableEntity
 
 		final StringBuilder wrapped = new StringBuilder(words[0]);
 		int spaceLeft = maxWidth - metrics.stringWidth(wrapped.toString());
+		final int spaceWidth = metrics.stringWidth(" ");
 
 		for (int i = 1; i < words.length; i++)
 		{
 			final String word = words[i];
 			final int wordLen = metrics.stringWidth(word);
-			final int spaceWidth = metrics.stringWidth(" ");
 
 			if (wordLen + spaceWidth > spaceLeft)
 			{
@@ -192,7 +209,34 @@ public class LineComponent implements LayoutableRenderableEntity
 			}
 		}
 
-		return wrapped.toString().split("\n");
+		return splitChar(wrapped.toString(), '\n');
+	}
+
+	/** Equivalent to {@code s.split(String.valueOf(delim), 0)} without regex compilation. */
+	private static String[] splitChar(String s, char delim)
+	{
+		int len = s.length();
+		if (len == 0)
+		{
+			return new String[]{""};
+		}
+		List<String> parts = new ArrayList<>();
+		int start = 0;
+		for (int i = 0; i < len; i++)
+		{
+			if (s.charAt(i) == delim)
+			{
+				parts.add(s.substring(start, i));
+				start = i + 1;
+			}
+		}
+		parts.add(s.substring(start, len));
+		int size = parts.size();
+		while (size > 0 && parts.get(size - 1).isEmpty())
+		{
+			size--;
+		}
+		return parts.subList(0, size).toArray(new String[0]);
 	}
 }
 

@@ -81,7 +81,34 @@ public class Text
 	 */
 	public static String removeTags(String str)
 	{
-		return TAG_REGEXP.matcher(str).replaceAll("");
+		int lt = str.indexOf('<');
+		if (lt < 0)
+		{
+			return str;
+		}
+		int gt = str.indexOf('>', lt + 1);
+		if (gt < 0)
+		{
+			return str;
+		}
+		int len = str.length();
+		StringBuilder sb = new StringBuilder(len);
+		int pos = 0;
+		while (lt >= 0 && gt >= 0)
+		{
+			if (lt > pos)
+			{
+				sb.append(str, pos, lt);
+			}
+			pos = gt + 1;
+			lt = str.indexOf('<', pos);
+			gt = lt >= 0 ? str.indexOf('>', lt + 1) : -1;
+		}
+		if (pos < len)
+		{
+			sb.append(str, pos, len);
+		}
+		return sb.toString();
 	}
 
 	/**
@@ -89,6 +116,10 @@ public class Text
 	 */
 	public static String unescapeJagex(String str)
 	{
+		if (str.indexOf('<') < 0)
+		{
+			return str;
+		}
 		return TAG_REGEXP.matcher(str)
 			.replaceAll(mr ->
 			{
@@ -119,6 +150,10 @@ public class Text
 	 */
 	public static String removeFormattingTags(String str)
 	{
+		if (str.indexOf('<') < 0)
+		{
+			return str;
+		}
 		StringBuilder sb = new StringBuilder();
 		Matcher matcher = TAG_REGEXP.matcher(str);
 		while (matcher.find())

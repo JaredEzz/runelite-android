@@ -70,6 +70,8 @@ public class PanelComponent implements LayoutableRenderableEntity
 	private Point gap = new Point(0, 0);
 
 	private final Dimension childDimensions = new Dimension();
+	private final BackgroundComponent backgroundComponent = new BackgroundComponent();
+	private final Rectangle backgroundRect = new Rectangle();
 
 	@Override
 	public Dimension render(Graphics2D graphics)
@@ -87,8 +89,8 @@ public class PanelComponent implements LayoutableRenderableEntity
 		// Render background
 		if (backgroundColor != null)
 		{
-			final BackgroundComponent backgroundComponent = new BackgroundComponent();
-			backgroundComponent.setRectangle(new Rectangle(preferredLocation, dimension));
+			backgroundRect.setBounds(preferredLocation.x, preferredLocation.y, dimension.width, dimension.height);
+			backgroundComponent.setRectangle(backgroundRect);
 			backgroundComponent.setBackgroundColor(backgroundColor);
 			backgroundComponent.render(graphics);
 		}
@@ -105,6 +107,11 @@ public class PanelComponent implements LayoutableRenderableEntity
 		final Dimension childPreferredSize = new Dimension(
 			preferredSize.width - border.x - border.width,
 			preferredSize.height - border.y - border.height);
+		final Dimension nonWrapChildSize = !wrap
+			? (orientation == ComponentOrientation.VERTICAL
+				? new Dimension(childPreferredSize.width, 0)
+				: new Dimension(0, childPreferredSize.height))
+			: null;
 
 		// Calculate max width/height for infoboxes
 		int totalHeight = 0;
@@ -116,15 +123,7 @@ public class PanelComponent implements LayoutableRenderableEntity
 			// Correctly propagate child dimensions based on orientation and wrapping
 			if (!wrap)
 			{
-				switch (orientation)
-				{
-					case VERTICAL:
-						child.setPreferredSize(new Dimension(childPreferredSize.width, 0));
-						break;
-					case HORIZONTAL:
-						child.setPreferredSize(new Dimension(0, childPreferredSize.height));
-						break;
-				}
+				child.setPreferredSize(nonWrapChildSize);
 			}
 
 			child.setPreferredLocation(new Point(x, y));

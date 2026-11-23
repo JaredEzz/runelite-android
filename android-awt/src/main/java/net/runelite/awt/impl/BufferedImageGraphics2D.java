@@ -101,6 +101,8 @@ public class BufferedImageGraphics2D extends Graphics2D {
     private Paint paint = Color.BLACK;
     private Color xorColor;
     private final RenderingHints renderingHints = new RenderingHints(null);
+    private TextAa cachedTextAa = TextAa.ON;
+    private boolean cachedStrokePure;
     /** Uniform user→device multiplier applied on top of {@link #transform}. Lets a host lay a
      *  Swing tree out in logical pixels but rasterize it at the display's real density
      *  (text, fills, borders and shapes are all drawn at device resolution instead of
@@ -212,7 +214,11 @@ public class BufferedImageGraphics2D extends Graphics2D {
         copy.stroke = stroke;
         copy.paint = paint;
         copy.xorColor = xorColor;
-        copy.renderingHints.add(renderingHints);
+        if (!renderingHints.isEmpty()) {
+            copy.renderingHints.copyFrom(renderingHints);
+        }
+        copy.cachedTextAa = cachedTextAa;
+        copy.cachedStrokePure = cachedStrokePure;
         copy.deviceScale = deviceScale;
         return copy;
     }
@@ -297,6 +303,25 @@ public class BufferedImageGraphics2D extends Graphics2D {
         }
         return new Rectangle(clip.x - tx(), clip.y - ty(), clip.width, clip.height);
     }
+
+    public Rectangle getClipBounds(Rectangle r) {
+        if (r == null) return getClipBounds();
+        if (!transformIsTranslateOnly()) {
+            r.setBounds(getClip().getBounds());
+            return r;
+        }
+        if (deviceScale != 1f) {
+            double s = deviceScale;
+            int x0 = (int) Math.floor(clip.x / s - transform.getTranslateX());
+            int y0 = (int) Math.floor(clip.y / s - transform.getTranslateY());
+            int x1 = (int) Math.ceil((clip.x + clip.width) / s - transform.getTranslateX());
+            int y1 = (int) Math.ceil((clip.y + clip.height) / s - transform.getTranslateY());
+            r.setBounds(x0, y0, x1 - x0, y1 - y0);
+            return r;
+        }
+        r.setBounds(clip.x - tx(), clip.y - ty(), clip.width, clip.height);
+        return r;
+    }
     @Override public void clipRect(int x, int y, int w, int h) {
         if(!transformIsTranslateOnly()){clip(new java.awt.geom.Rectangle2D.Double(x,y,w,h));return;}
         // Inlined `clip.intersection(new Rectangle(...))` — the JDK version allocates
@@ -369,10 +394,22 @@ public class BufferedImageGraphics2D extends Graphics2D {
             clipRects = null;
         }
     }
+    private void setDeviceClipRect(int nx, int ny, int nw, int nh) {
+        if (clipRects == null && clip.x == nx && clip.y == ny && clip.width == nw && clip.height == nh) {
+            return;
+        }
+        clip.setBounds(nx, ny, nw, nh);
+        clipRects = null;
+    }
+
     @Override public void setClip(int x, int y, int w, int h) {
         if(!transformIsTranslateOnly()){setClip(new java.awt.geom.Rectangle2D.Double(x,y,w,h));return;}
-        clip = deviceRect(x, y, w, h);
-        clipRects = null;
+        if (deviceScale == 1f) {
+            setDeviceClipRect(x + tx(), y + ty(), w, h);
+        } else {
+            int x0 = devX(x), y0 = devY(y);
+            setDeviceClipRect(x0, y0, devX(x + (double) w) - x0, devY(y + (double) h) - y0);
+        }
     }
     @Override public Shape getClip() {
         if (!transformIsTranslateOnly()) {
@@ -399,16 +436,21 @@ public class BufferedImageGraphics2D extends Graphics2D {
     }
     @Override public void setClip(Shape shape) {
         syncTarget();
-        clipRects = null;
         if (shape == null) {
-            clip = new Rectangle(0, 0, width, height);
+            setDeviceClipRect(0, 0, width, height);
             return;
         }
         if (shape instanceof Rectangle && transformIsTranslateOnly()) {
             Rectangle b = (Rectangle) shape;
-            clip = deviceRect(b.x, b.y, b.width, b.height);
+            if (deviceScale == 1f) {
+                setDeviceClipRect(b.x + tx(), b.y + ty(), b.width, b.height);
+            } else {
+                int x0 = devX(b.x), y0 = devY(b.y);
+                setDeviceClipRect(x0, y0, devX(b.x + (double) b.width) - x0, devY(b.y + (double) b.height) - y0);
+            }
             return;
         }
+        clipRects = null;
         int[] r = deviceClipFor(shape, 0, 0, width, height);
         if (r == null) {
             Rectangle b = shape.getBounds();
@@ -589,6 +631,32 @@ public class BufferedImageGraphics2D extends Graphics2D {
             activeClip, n, foreground.getRGB(), compositeRule());
     }
 
+    /** Fill a device rect intersected with the active clip bounds and image without allocating a Rectangle. */
+    private void fillDevice(int rx, int ry, int rw, int rh, int argb, int rule) {
+        if (rw <= 0 || rh <= 0) return;
+        if (clipRects == null) {
+            int x0 = Math.max(0, Math.max(rx, clip.x));
+            int y0 = Math.max(0, Math.max(ry, clip.y));
+            int x1 = (int) Math.min(width, Math.min((long) rx + rw, (long) clip.x + clip.width));
+            int y1 = (int) Math.min(height, Math.min((long) ry + rh, (long) clip.y + clip.height));
+            if (x0 < x1 && y0 < y1) {
+                AwtNative.fillRect(pixels, width, height, x0, y0, x1 - x0, y1 - y0, argb, rule);
+            }
+            return;
+        }
+        int dx0 = Math.max(0, Math.max(rx, clip.x));
+        int dy0 = Math.max(0, Math.max(ry, clip.y));
+        int dx1 = (int) Math.min(width, Math.min((long) rx + rw, (long) clip.x + clip.width));
+        int dy1 = (int) Math.min(height, Math.min((long) ry + rh, (long) clip.y + clip.height));
+        if (dx0 >= dx1 || dy0 >= dy1) return;
+        int[] cr = clipRects;
+        for (int i = 0; i < cr.length; i += 4) {
+            int a = Math.max(dx0, cr[i]), b = Math.max(dy0, cr[i + 1]);
+            int c = Math.min(dx1, cr[i + 2]), d = Math.min(dy1, cr[i + 3]);
+            if (a < c && b < d) AwtNative.fillRect(pixels, width, height, a, b, c - a, d - b, argb, rule);
+        }
+    }
+
     /** Fill a device rect already intersected with the clip bounds and image. */
     private void fillDevice(Rectangle r, int argb, int rule) {
         if (r.width == 0 || r.height == 0) return;
@@ -613,8 +681,14 @@ public class BufferedImageGraphics2D extends Graphics2D {
             if (w > 0 && h > 0) fillShape(new Rectangle(x, y, w, h));
             return;
         }
-        Rectangle r = deviceScale == 1f ? clipped(x + tx(), y + ty(), w, h) : clippedDevice(x, y, w, h);
-        fillDevice(r, foreground.getRGB(), compositeRule());
+        if (w <= 0 || h <= 0) return;
+        if (deviceScale == 1f) {
+            fillDevice(x + tx(), y + ty(), w, h, foreground.getRGB(), compositeRule());
+        } else {
+            int x0 = devX(x), y0 = devY(y);
+            fillDevice(x0, y0, devX(x + (double) w) - x0, devY(y + (double) h) - y0,
+                foreground.getRGB(), compositeRule());
+        }
     }
 
     /** Sample visible strips and reuse the image compositor for alpha and shape clips. */
@@ -640,8 +714,14 @@ public class BufferedImageGraphics2D extends Graphics2D {
     public void clearRect(int x,int y,int w,int h) {
         if(generalRendering()){Paint previous=paint;Composite comp=composite;Color xor=xorColor;try{paint=background;composite=AlphaComposite.Src;xorColor=null;generalShape(new Rectangle(x,y,w,h),true);}finally{paint=previous;composite=comp;xorColor=xor;}return;}
         syncTarget();
-        Rectangle r = deviceScale == 1f ? clipped(x + tx(), y + ty(), w, h) : clippedDevice(x, y, w, h);
-        fillDevice(r, background.getRGB(), AlphaComposite.SRC);
+        if (w <= 0 || h <= 0) return;
+        if (deviceScale == 1f) {
+            fillDevice(x + tx(), y + ty(), w, h, background.getRGB(), AlphaComposite.SRC);
+        } else {
+            int x0 = devX(x), y0 = devY(y);
+            fillDevice(x0, y0, devX(x + (double) w) - x0, devY(y + (double) h) - y0,
+                background.getRGB(), AlphaComposite.SRC);
+        }
     }
 
     @Override
@@ -649,6 +729,20 @@ public class BufferedImageGraphics2D extends Graphics2D {
         if(generalRendering()){generalShape(new Rectangle(x,y,w,h),false);return;}
         if (w < 0 || h < 0) return;
         if (plainThinStroke()) {
+            if (deviceScale == 1f && clipRects == null && transformIsTranslateOnly()) {
+                syncTarget();
+                int px = x + tx(), py = y + ty();
+                int argb = foreground.getRGB(), rule = compositeRule();
+                if (w == 0 || h == 0) {
+                    fillDevice(px, py, w + 1, h + 1, argb, rule);
+                } else {
+                    fillDevice(px, py, w, 1, argb, rule);
+                    fillDevice(px + w, py, 1, h, argb, rule);
+                    fillDevice(px + 1, py + h, w, 1, argb, rule);
+                    fillDevice(px, py + 1, 1, h, argb, rule);
+                }
+                return;
+            }
             super.drawRect(x, y, w, h);
             return;
         }
@@ -732,7 +826,7 @@ public class BufferedImageGraphics2D extends Graphics2D {
      */
     private void strokeDevice(Contours path) {
         BasicStroke bs = (BasicStroke) stroke;
-        if (renderingHints.get(RenderingHints.KEY_STROKE_CONTROL) != RenderingHints.VALUE_STROKE_PURE) normalize(path);
+        if (!cachedStrokePure) normalize(path);
         double scale = userScale() * deviceScale;
         Contours[] scratch = CONTOUR_SCRATCH.get();
         Contours src = path;
@@ -1101,7 +1195,7 @@ public class BufferedImageGraphics2D extends Graphics2D {
         double m00 = transform.getScaleX(), m01 = transform.getShearX(), m02 = transform.getTranslateX();
         double m10 = transform.getShearY(), m11 = transform.getScaleY(), m12 = transform.getTranslateY();
         double s = deviceScale;
-        boolean pure = renderingHints.get(RenderingHints.KEY_STROKE_CONTROL) == RenderingHints.VALUE_STROKE_PURE;
+        boolean pure = cachedStrokePure;
         double[] xy = c.xy;
         for (int i = 0; i < n; i++) {
             double x = xs[i], y = ys[i];
@@ -1159,6 +1253,8 @@ public class BufferedImageGraphics2D extends Graphics2D {
         int baseX, baseY;
         if (deviceScale == 1f) {
             baseX = x + tx(); baseY = y + ty();
+            float size = BufferedImageFontMetrics.pxSize(font);
+            if (baseY + size + 8 < clip.y || baseY - 2f * size - 8 > clip.y + clip.height) return;
         } else {
             baseX = devX(x); baseY = devY(y);
             // Rows scrolled out of a viewport still get painted; skip them before the
@@ -1235,21 +1331,25 @@ public class BufferedImageGraphics2D extends Graphics2D {
      * Falls back to KEY_ANTIALIASING when the text-specific hint is left at DEFAULT.
      */
     private TextAa textAaMode() {
+        return cachedTextAa;
+    }
+
+    private void refreshHintCache() {
         Object v = renderingHints.get(RenderingHints.KEY_TEXT_ANTIALIASING);
         if (v == null || v == RenderingHints.VALUE_TEXT_ANTIALIAS_DEFAULT) {
-            // Fall back to the general antialiasing hint.
             Object g = renderingHints.get(RenderingHints.KEY_ANTIALIASING);
-            if (g == RenderingHints.VALUE_ANTIALIAS_OFF) return TextAa.OFF;
-            // Default to ON — RuneLite + FlatLaf both expect AA text by default.
-            return TextAa.ON;
-        }
-        if (v == RenderingHints.VALUE_TEXT_ANTIALIAS_OFF) return TextAa.OFF;
-        if (v == RenderingHints.VALUE_TEXT_ANTIALIAS_GASP) return TextAa.ON;
-        if (v == RenderingHints.VALUE_TEXT_ANTIALIAS_LCD_HRGB
+            cachedTextAa = (g == RenderingHints.VALUE_ANTIALIAS_OFF) ? TextAa.OFF : TextAa.ON;
+        } else if (v == RenderingHints.VALUE_TEXT_ANTIALIAS_OFF) {
+            cachedTextAa = TextAa.OFF;
+        } else if (v == RenderingHints.VALUE_TEXT_ANTIALIAS_LCD_HRGB
             || v == RenderingHints.VALUE_TEXT_ANTIALIAS_LCD_HBGR
             || v == RenderingHints.VALUE_TEXT_ANTIALIAS_LCD_VRGB
-            || v == RenderingHints.VALUE_TEXT_ANTIALIAS_LCD_VBGR) return TextAa.LCD;
-        return TextAa.ON;
+            || v == RenderingHints.VALUE_TEXT_ANTIALIAS_LCD_VBGR) {
+            cachedTextAa = TextAa.LCD;
+        } else {
+            cachedTextAa = TextAa.ON;
+        }
+        cachedStrokePure = renderingHints.get(RenderingHints.KEY_STROKE_CONTROL) == RenderingHints.VALUE_STROKE_PURE;
     }
 
     enum TextAa { OFF, ON, LCD }
@@ -1792,10 +1892,26 @@ public class BufferedImageGraphics2D extends Graphics2D {
     @Override public void scale(double sx, double sy) { transform.scale(sx, sy); }
     @Override public void shear(double shx,double shy) {transform.shear(shx,shy);}
 
-    @Override public void setRenderingHint(RenderingHints.Key key, Object val) { renderingHints.put(key, val); }
+    @Override public void setRenderingHint(RenderingHints.Key key, Object val) {
+        renderingHints.put(key, val);
+        refreshHintCache();
+    }
     @Override public Object getRenderingHint(RenderingHints.Key key) { return renderingHints.get(key); }
-    @Override public void setRenderingHints(java.util.Map<?, ?> hints) { renderingHints.clear(); renderingHints.putAll(hints); }
-    @Override public void addRenderingHints(java.util.Map<?, ?> hints) { renderingHints.putAll(hints); }
+    @Override public void setRenderingHints(java.util.Map<?, ?> hints) {
+        if (hints == renderingHints) return;
+        if (hints instanceof RenderingHints) {
+            if (!renderingHints.copyFrom((RenderingHints) hints)) return;
+        } else {
+            renderingHints.clear();
+            if (hints != null) renderingHints.putAll(hints);
+        }
+        refreshHintCache();
+    }
+    @Override public void addRenderingHints(java.util.Map<?, ?> hints) {
+        if (hints == null || hints.isEmpty()) return;
+        renderingHints.putAll(hints);
+        refreshHintCache();
+    }
     @Override public RenderingHints getRenderingHints() { return (RenderingHints) renderingHints.clone(); }
 
     @Override public FontRenderContext getFontRenderContext() { return new FontRenderContext(transform, renderingHints.get(RenderingHints.KEY_TEXT_ANTIALIASING)==null?RenderingHints.VALUE_TEXT_ANTIALIAS_DEFAULT:renderingHints.get(RenderingHints.KEY_TEXT_ANTIALIASING), renderingHints.get(RenderingHints.KEY_FRACTIONALMETRICS)==null?RenderingHints.VALUE_FRACTIONALMETRICS_DEFAULT:renderingHints.get(RenderingHints.KEY_FRACTIONALMETRICS)); }

@@ -53,13 +53,28 @@ public abstract class WidgetItemOverlay extends Overlay
 	public Dimension render(Graphics2D graphics)
 	{
 		final Collection<WidgetItem> widgetItems = overlayManager.getWidgetItems();
+		if (widgetItems.isEmpty())
+		{
+			return null;
+		}
 		final Rectangle originalClipBounds = graphics.getClipBounds();
 		Widget curClipParent = null;
+		Widget lastParent = null;
+		Rectangle lastParentBounds = null;
 		for (WidgetItem widgetItem : widgetItems)
 		{
 			Widget widget = widgetItem.getWidget();
 			Widget parent = widget.getParent();
-			Rectangle parentBounds = parent.getBounds();
+			Rectangle parentBounds;
+			if (parent != null && parent == lastParent)
+			{
+				parentBounds = lastParentBounds;
+			}
+			else
+			{
+				lastParent = parent;
+				parentBounds = lastParentBounds = parent.getBounds();
+			}
 			Rectangle itemCanvasBounds = widgetItem.getCanvasBounds();
 			boolean dragging = widgetItem.getDraggingCanvasBounds() != null;
 
