@@ -66,17 +66,29 @@ internal class PluginDexer(private val context: Context) : PluginHubHooks.Dexer
                     .filter { it.name.endsWith(".class") }
                     .map { it.name.removeSuffix(".class") }.toSet()
                 ZipOutputStream(compatibleJar.outputStream().buffered()).use { output ->
+                    val written = HashSet<String>()
                     for (entry in input.entries())
                     {
                         if (entry.isDirectory) continue
                         val bytes = input.getInputStream(entry).use { it.readBytes() }
-                        output.putNextEntry(ZipEntry(entry.name))
-                        try {
-                            output.write(PluginClassTransform.rewrite(entry.name, bytes, jarClasses))
+                        val rewritten = try {
+                            PluginClassTransform.rewrite(entry.name, bytes, jarClasses)
                         } catch (e: IllegalArgumentException) {
                             throw PluginHubHooks.DexException("${entry.name}: ${e.message}", e)
                         }
-                        output.closeEntry()
+                        val ev = if (entry.name.endsWith(".class")) {
+                            net.runelite.mp.compat.EventInvokerGenerator.transform(rewritten)
+                        } else null
+                        if (written.add(entry.name)) {
+                            output.putNextEntry(ZipEntry(entry.name))
+                            output.write(ev?.classBytes ?: rewritten)
+                            output.closeEntry()
+                        }
+                        if (ev != null && written.add(ev.invokerEntryName)) {
+                            output.putNextEntry(ZipEntry(ev.invokerEntryName))
+                            output.write(ev.invokerBytes)
+                            output.closeEntry()
+                        }
                     }
                 }
             }
@@ -182,7 +194,7 @@ internal class PluginDexer(private val context: Context) : PluginHubHooks.Dexer
          * Core-library types must match the APK, including Flow publisher signatures. `jdk1` is
          * the first JdkRetargets table; bump it whenever a row or shim name changes.
          */
-        private const val FORMAT = "v5-jdk1-${RuntimeDexConfiguration.CACHE_VERSION}"
+        private const val FORMAT = "v5-jdk1-ev1-${RuntimeDexConfiguration.CACHE_VERSION}"
         private val DEX_NAME = Regex("""classes\d*\.dex""")
         private val DESKTOP_ONLY = listOf(
             "org/lwjgl/" to "LWJGL (desktop OpenGL)",

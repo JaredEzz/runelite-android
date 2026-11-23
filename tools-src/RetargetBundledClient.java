@@ -9,6 +9,7 @@ import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
+import net.runelite.mp.compat.EventInvokerGenerator;
 import net.runelite.mp.compat.JdkRetargeter;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
@@ -27,6 +28,7 @@ public final class RetargetBundledClient {
         Files.createDirectories(output.getParent());
         Path partial = Files.createTempFile(output.getParent(), "retarget-", ".jar");
         int changed = 0;
+        int invokers = 0;
         try {
             try (ZipFile zip = new ZipFile(input.toFile());
                  ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(partial))) {
@@ -34,6 +36,7 @@ public final class RetargetBundledClient {
                     .map(ZipEntry::getName).sorted().collect(Collectors.toList());
                 Set<String> classes = names.stream().filter(n -> n.endsWith(".class"))
                     .map(n -> n.substring(0, n.length() - 6)).collect(Collectors.toSet());
+                Set<String> existing = new java.util.HashSet<>(names);
                 for (String name : names) {
                     // Signatures describe the original bytecode, not this Android derivative.
                     String upper = name.toUpperCase(java.util.Locale.ROOT);
@@ -44,6 +47,10 @@ public final class RetargetBundledClient {
                     try (var stream = zip.getInputStream(zip.getEntry(name))) { original = stream.readAllBytes(); }
                     byte[] bytes = JdkRetargeter.rewrite(name, original, classes, false);
                     if (name.equals("net/runelite/client/RuneLite.class")) bytes = adaptPluginStartup(bytes);
+                    EventInvokerGenerator.Result ev = name.endsWith(".class") ? EventInvokerGenerator.transform(bytes) : null;
+                    if (ev != null) {
+                        bytes = ev.classBytes;
+                    }
                     if (bytes != original) {
                         if (!publicApi(original).equals(publicApi(bytes))) {
                             throw new IOException("Retargeting changes the public client API: " + name);
@@ -60,11 +67,19 @@ public final class RetargetBundledClient {
                     out.putNextEntry(entry);
                     out.write(bytes);
                     out.closeEntry();
+                    if (ev != null && existing.add(ev.invokerEntryName)) {
+                        ZipEntry invEntry = new ZipEntry(ev.invokerEntryName);
+                        invEntry.setTime(0);
+                        out.putNextEntry(invEntry);
+                        out.write(ev.invokerBytes);
+                        out.closeEntry();
+                        invokers++;
+                    }
                 }
             }
             Files.move(partial, output, StandardCopyOption.REPLACE_EXISTING);
         } finally { Files.deleteIfExists(partial); }
-        System.out.println("Bundled client: retargeted " + changed + " classes for Android");
+        System.out.println("Bundled client: retargeted " + changed + " classes for Android, generated " + invokers + " EventBus invokers");
     }
 
     /** Keep Android's DEX discovery at the desktop lifecycle point, before external plugins. */

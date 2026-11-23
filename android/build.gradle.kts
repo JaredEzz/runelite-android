@@ -340,7 +340,8 @@ if (androidSdkAvailable) {
     val compileRetargetTool = tasks.register<JavaCompile>("compileBundledClientRetargetTool") {
         source(rootProject.file("tools-src/RetargetBundledClient.java"),
             file("src/androidMain/java/net/runelite/mp/compat/JdkRetargeter.java"),
-            file("src/androidMain/java/net/runelite/mp/compat/jdk/JdkRetargets.java"))
+            file("src/androidMain/java/net/runelite/mp/compat/jdk/JdkRetargets.java"),
+            file("src/androidMain/java/net/runelite/mp/compat/EventInvokerGenerator.java"))
         classpath = retargetToolClasspath
         destinationDirectory.set(layout.buildDirectory.dir("compat-client/tool"))
     }

@@ -78,6 +78,18 @@ public class TextComponent implements RenderableEntity
 
 		final FontMetrics fontMetrics = graphics.getFontMetrics();
 
+		if (text.indexOf("<col=") < 0)
+		{
+			renderText(graphics, color, positionX, positionY, text);
+			int width = fontMetrics.stringWidth(text);
+			int height = fontMetrics.getHeight();
+			if (originalFont != null)
+			{
+				graphics.setFont(originalFont);
+			}
+			return new Dimension(width, height);
+		}
+
 		Matcher matcher = COL_TAG_PATTERN.matcher(text);
 		Color textColor = color;
 		int idx = 0;

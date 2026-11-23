@@ -47,45 +47,46 @@ public class BackgroundComponent implements RenderableEntity
 	private Color backgroundColor = ComponentConstants.STANDARD_BACKGROUND_COLOR;
 	private Rectangle rectangle = new Rectangle();
 	private boolean fill = true;
+	private Color cachedBgColor;
+	private Color cachedOutsideStrokeColor;
+	private Color cachedInsideStrokeColor;
 
 	@Override
 	public Dimension render(Graphics2D graphics)
 	{
-		Color outsideStrokeColor = new Color(
-			(int) (backgroundColor.getRed() * OUTER_COLOR_OFFSET),
-			(int) (backgroundColor.getGreen() * OUTER_COLOR_OFFSET),
-			(int) (backgroundColor.getBlue() * OUTER_COLOR_OFFSET),
-			Math.min(255, (int) (backgroundColor.getAlpha() * ALPHA_COLOR_OFFSET))
-		);
-
-		Color insideStrokeColor = new Color(
-			Math.min(255, (int) (backgroundColor.getRed() * INNER_COLOR_OFFSET)),
-			Math.min(255, (int) (backgroundColor.getGreen() * INNER_COLOR_OFFSET)),
-			Math.min(255, (int) (backgroundColor.getBlue() * INNER_COLOR_OFFSET)),
-			Math.min(255, (int) (backgroundColor.getAlpha() * ALPHA_COLOR_OFFSET))
-		);
+		if (cachedBgColor == null || !cachedBgColor.equals(backgroundColor))
+		{
+			cachedBgColor = backgroundColor;
+			cachedOutsideStrokeColor = new Color(
+				(int) (backgroundColor.getRed() * OUTER_COLOR_OFFSET),
+				(int) (backgroundColor.getGreen() * OUTER_COLOR_OFFSET),
+				(int) (backgroundColor.getBlue() * OUTER_COLOR_OFFSET),
+				Math.min(255, (int) (backgroundColor.getAlpha() * ALPHA_COLOR_OFFSET))
+			);
+			cachedInsideStrokeColor = new Color(
+				Math.min(255, (int) (backgroundColor.getRed() * INNER_COLOR_OFFSET)),
+				Math.min(255, (int) (backgroundColor.getGreen() * INNER_COLOR_OFFSET)),
+				Math.min(255, (int) (backgroundColor.getBlue() * INNER_COLOR_OFFSET)),
+				Math.min(255, (int) (backgroundColor.getAlpha() * ALPHA_COLOR_OFFSET))
+			);
+		}
 
 		// Render background
 		if (fill)
 		{
 			graphics.setColor(backgroundColor);
-			graphics.fill(rectangle);
+			graphics.fillRect(rectangle.x, rectangle.y, rectangle.width, rectangle.height);
 		}
 
 		// Render outside stroke
-		final Rectangle outsideStroke = new Rectangle();
-		outsideStroke.setLocation(rectangle.x, rectangle.y);
-		outsideStroke.setSize(rectangle.width - BORDER_OFFSET / 2, rectangle.height - BORDER_OFFSET / 2);
-		graphics.setColor(outsideStrokeColor);
-		graphics.draw(outsideStroke);
+		graphics.setColor(cachedOutsideStrokeColor);
+		graphics.drawRect(rectangle.x, rectangle.y, rectangle.width - BORDER_OFFSET / 2, rectangle.height - BORDER_OFFSET / 2);
 
 		// Render inside stroke
-		final Rectangle insideStroke = new Rectangle();
-		insideStroke.setLocation(rectangle.x + BORDER_OFFSET / 2, rectangle.y + BORDER_OFFSET / 2);
-		insideStroke.setSize(rectangle.width - BORDER_OFFSET - BORDER_OFFSET / 2,
-				rectangle.height - BORDER_OFFSET - BORDER_OFFSET / 2);
-		graphics.setColor(insideStrokeColor);
-		graphics.draw(insideStroke);
+		graphics.setColor(cachedInsideStrokeColor);
+		graphics.drawRect(rectangle.x + BORDER_OFFSET / 2, rectangle.y + BORDER_OFFSET / 2,
+			rectangle.width - BORDER_OFFSET - BORDER_OFFSET / 2,
+			rectangle.height - BORDER_OFFSET - BORDER_OFFSET / 2);
 
 		return new Dimension(rectangle.getSize());
 	}

@@ -100,6 +100,20 @@ public class RenderingHints implements Map<Object, Object>, Cloneable {
 
     public static final Key KEY_TEXT_LCD_CONTRAST = new Key(10);
 
+    private static final Key[] STD_KEYS = {
+        null,
+        KEY_ANTIALIASING,
+        KEY_TEXT_ANTIALIASING,
+        KEY_RENDERING,
+        KEY_INTERPOLATION,
+        KEY_ALPHA_INTERPOLATION,
+        KEY_COLOR_RENDERING,
+        KEY_DITHERING,
+        KEY_FRACTIONALMETRICS,
+        KEY_STROKE_CONTROL,
+        KEY_TEXT_LCD_CONTRAST,
+    };
+
     public static final Object VALUE_TEXT_ANTIALIAS_GASP = "VALUE_TEXT_ANTIALIAS_GASP";
     public static final Object VALUE_TEXT_ANTIALIAS_LCD_HRGB = "VALUE_TEXT_ANTIALIAS_LCD_HRGB";
     public static final Object VALUE_TEXT_ANTIALIAS_LCD_HBGR = "VALUE_TEXT_ANTIALIAS_LCD_HBGR";
@@ -107,34 +121,119 @@ public class RenderingHints implements Map<Object, Object>, Cloneable {
     public static final Object VALUE_TEXT_ANTIALIAS_LCD_VBGR = "VALUE_TEXT_ANTIALIAS_LCD_VBGR";
 
     private final HashMap<Object, Object> map = new HashMap<>();
+    private final Object[] fast = new Object[STD_KEYS.length];
+    private int extraCount;
 
     public RenderingHints(Map<Key, ?> init) {
-        if (init != null) map.putAll(init);
+        if (init != null) putAll(init);
     }
 
     public RenderingHints(Key key, Object value) {
-        map.put(key, value);
+        put(key, value);
     }
 
-    public void add(RenderingHints hints) { map.putAll(hints.map); }
+    public void add(RenderingHints hints) {
+        if (hints == null || hints.isEmpty()) return;
+        putAll(hints);
+    }
     @Override public int size() { return map.size(); }
     @Override public boolean isEmpty() { return map.isEmpty(); }
-    @Override public boolean containsKey(Object key) { return map.containsKey(key); }
+    @Override public boolean containsKey(Object key) {
+        int id = stdIndex(key);
+        if (id > 0) return fast[id] != null;
+        return map.containsKey(key);
+    }
     @Override public boolean containsValue(Object value) { return map.containsValue(value); }
-    @Override public Object get(Object key) { return map.get(key); }
-    @Override public Object put(Object key, Object value) { return map.put(key, value); }
-    @Override public Object remove(Object key) { return map.remove(key); }
+    @Override public Object get(Object key) {
+        int id = stdIndex(key);
+        if (id > 0) return fast[id];
+        return map.get(key);
+    }
+    @Override public Object put(Object key, Object value) {
+        int id = stdIndex(key);
+        if (id > 0) {
+            fast[id] = value;
+            return map.put(key, value);
+        }
+        Object prev = map.put(key, value);
+        if (prev == null) extraCount++;
+        return prev;
+    }
+    @Override public Object remove(Object key) {
+        int id = stdIndex(key);
+        if (id > 0) {
+            fast[id] = null;
+            return map.remove(key);
+        }
+        Object prev = map.remove(key);
+        if (prev != null) extraCount--;
+        return prev;
+    }
     @Override @SuppressWarnings("unchecked")
-    public void putAll(Map<?, ?> m) { map.putAll((Map<? extends Object, ? extends Object>) m); }
-    @Override public void clear() { map.clear(); }
+    public void putAll(Map<?, ?> m) {
+        if (m == null || m.isEmpty()) return;
+        if (m instanceof RenderingHints) {
+            RenderingHints o = (RenderingHints) m;
+            if (o.extraCount == 0) {
+                for (int i = 1; i < STD_KEYS.length; i++) {
+                    Object v = o.fast[i];
+                    if (v != null) {
+                        fast[i] = v;
+                        map.put(STD_KEYS[i], v);
+                    }
+                }
+                return;
+            }
+        }
+        for (Entry<?, ?> e : m.entrySet()) {
+            put(e.getKey(), e.getValue());
+        }
+    }
+    @Override public void clear() {
+        java.util.Arrays.fill(fast, null);
+        extraCount = 0;
+        if (!map.isEmpty()) map.clear();
+    }
     @Override public Set<Object> keySet() { return map.keySet(); }
     @Override public Collection<Object> values() { return map.values(); }
     @Override public Set<Entry<Object, Object>> entrySet() { return map.entrySet(); }
 
+    /** Replaces all hints from {@code other}, returning false without touching maps when identical. */
+    public boolean copyFrom(RenderingHints other) {
+        if (other == this) return false;
+        if (other == null || other.isEmpty()) {
+            if (isEmpty()) return false;
+            clear();
+            return true;
+        }
+        if (extraCount == 0 && other.extraCount == 0) {
+            boolean changed = false;
+            for (int i = 1; i < STD_KEYS.length; i++) {
+                Object v = other.fast[i];
+                if (!java.util.Objects.equals(fast[i], v)) {
+                    changed = true;
+                    fast[i] = v;
+                    if (v == null) map.remove(STD_KEYS[i]);
+                    else map.put(STD_KEYS[i], v);
+                }
+            }
+            return changed;
+        }
+        clear();
+        putAll(other);
+        return true;
+    }
+
+    private static int stdIndex(Object key) {
+        if (!(key instanceof Key)) return 0;
+        int id = ((Key) key).intKey();
+        return (id >= 1 && id < STD_KEYS.length && key == STD_KEYS[id]) ? id : 0;
+    }
+
     @Override
     public Object clone() {
         RenderingHints copy = new RenderingHints(null);
-        copy.map.putAll(this.map);
+        copy.copyFrom(this);
         return copy;
     }
 

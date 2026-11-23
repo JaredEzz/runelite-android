@@ -99,6 +99,10 @@ public class OverlayRenderer extends MouseAdapter
 
 	private Font font, tooltipFont, interfaceFont;
 
+	// Scratch geometry reused across renderLayer calls to avoid per-frame allocations
+	private final Point overlayLocation = new Point();
+	private final Rectangle layerClip = new Rectangle();
+
 	// Overlay movement variables
 	private final Point overlayOffset = new Point();
 	private final Point mousePosition = new Point();
@@ -297,10 +301,11 @@ public class OverlayRenderer extends MouseAdapter
 		this.tooltipFont = runeLiteConfig.tooltipFont().getFont();
 		this.interfaceFont = runeLiteConfig.interfaceFont().getFont();
 
-		final Rectangle clip = clipBounds(layer);
+		final Rectangle clip = layerClip;
+		clipBoundsInto(layer, clip);
 		graphics.setClip(clip);
 
-		final Point location = new Point();
+		final Point location = this.overlayLocation;
 		for (Overlay overlay : overlays)
 		{
 			if (failedOverlays.contains(overlay))
@@ -352,10 +357,7 @@ public class OverlayRenderer extends MouseAdapter
 			graphics.setPaint(paint);
 			graphics.setRenderingHints(renderingHints);
 			graphics.setBackground(background);
-			if (!clip.equals(graphics.getClip()))
-			{
-				graphics.setClip(clip);
-			}
+			graphics.setClip(clip);
 
 			if (!bounds.isEmpty())
 			{
@@ -733,18 +735,18 @@ public class OverlayRenderer extends MouseAdapter
 		return mouseEvent;
 	}
 
-	private Rectangle clipBounds(OverlayLayer layer)
+	private void clipBoundsInto(OverlayLayer layer, Rectangle out)
 	{
 		if (!client.isResized() && (layer == OverlayLayer.ABOVE_SCENE || layer == OverlayLayer.UNDER_WIDGETS))
 		{
-			return new Rectangle(client.getViewportXOffset(),
+			out.setBounds(client.getViewportXOffset(),
 				client.getViewportYOffset(),
 				client.getViewportWidth(),
 				client.getViewportHeight());
 		}
 		else
 		{
-			return new Rectangle(0, 0, client.getCanvasWidth(), client.getCanvasHeight());
+			out.setBounds(0, 0, client.getCanvasWidth(), client.getCanvasHeight());
 		}
 	}
 

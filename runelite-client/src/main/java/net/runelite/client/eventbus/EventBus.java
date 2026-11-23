@@ -39,6 +39,7 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import javax.annotation.Nonnull;
 import javax.annotation.concurrent.ThreadSafe;
@@ -77,6 +78,45 @@ public class EventBus
 		IS_ANDROID = vm.contains("Dalvik") || vm.contains("Android");
 	}
 
+	/**
+	 * Generated (build-time or dex-time) direct event invoker companion ({@code Target$$EventInvoker})
+	 * avoiding {@link Method#invoke} and {@code LambdaMetafactory} overhead on Android ART.
+	 */
+	public interface ClassInvoker
+	{
+		int resolve(String methodName, Class<?> eventType);
+
+		void invoke(Object target, int slot, Object event) throws Exception;
+	}
+
+	private static final Object NO_INVOKER = new Object();
+	private static final ConcurrentHashMap<Class<?>, Object> INVOKER_CACHE = new ConcurrentHashMap<>();
+
+	private static ClassInvoker findClassInvoker(Class<?> clazz)
+	{
+		Object cached = INVOKER_CACHE.get(clazz);
+		if (cached == null)
+		{
+			Object resolved = NO_INVOKER;
+			try
+			{
+				Class<?> invokerClass = Class.forName(clazz.getName() + "$$EventInvoker", false, clazz.getClassLoader());
+				Object instance = invokerClass.getDeclaredConstructor().newInstance();
+				if (instance instanceof ClassInvoker)
+				{
+					resolved = instance;
+				}
+			}
+			catch (Throwable ignored)
+			{
+				// Fall back to LambdaMetafactory / Method.invoke when no companion class exists.
+			}
+			Object prev = INVOKER_CACHE.putIfAbsent(clazz, resolved);
+			cached = prev != null ? prev : resolved;
+		}
+		return cached == NO_INVOKER ? null : (ClassInvoker) cached;
+	}
+
 	@Value
 	public static class Subscriber
 	{
@@ -85,10 +125,18 @@ public class EventBus
 		private final float priority;
 		@EqualsAndHashCode.Exclude
 		private final Consumer<Object> lambda;
+		@EqualsAndHashCode.Exclude
+		private final ClassInvoker invoker;
+		@EqualsAndHashCode.Exclude
+		private final int invokerSlot;
 
 		void invoke(final Object arg) throws Exception
 		{
-			if (lambda != null)
+			if (invoker != null)
+			{
+				invoker.invoke(object, invokerSlot, arg);
+			}
+			else if (lambda != null)
 			{
 				lambda.accept(arg);
 			}
@@ -130,6 +178,7 @@ public class EventBus
 
 		for (Class<?> clazz = object.getClass(); clazz != null; clazz = clazz.getSuperclass())
 		{
+			ClassInvoker classInvoker = findClassInvoker(clazz);
 			for (final Method method : clazz.getDeclaredMethods())
 			{
 				final Subscribe sub = method.getAnnotation(Subscribe.class);
@@ -159,34 +208,39 @@ public class EventBus
 				final String preferredName = "on" + parameterClazz.getSimpleName();
 				Preconditions.checkArgument(method.getName().equals(preferredName), "Subscribed method " + method + " should be named " + preferredName);
 
-				method.setAccessible(true);
+				int invokerSlot = classInvoker != null ? classInvoker.resolve(method.getName(), parameterClazz) : -1;
 				Consumer<Object> lambda = null;
 
-				if (!IS_ANDROID)
+				if (invokerSlot < 0)
 				{
-					try
-					{
-						final MethodHandles.Lookup caller = ReflectUtil.privateLookupIn(clazz);
-						final MethodType subscription = MethodType.methodType(void.class, parameterClazz);
-						final MethodHandle target = caller.findVirtual(clazz, method.getName(), subscription);
-						final CallSite site = LambdaMetafactory.metafactory(
-							caller,
-							"accept",
-							MethodType.methodType(Consumer.class, clazz),
-							subscription.changeParameterType(0, Object.class),
-							target,
-							subscription);
+					method.setAccessible(true);
 
-						final MethodHandle factory = site.getTarget();
-						lambda = (Consumer<Object>) factory.bindTo(object).invokeExact();
-					}
-					catch (Throwable e)
+					if (!IS_ANDROID)
 					{
-						log.warn("Unable to create lambda for method {}", method, e);
+						try
+						{
+							final MethodHandles.Lookup caller = ReflectUtil.privateLookupIn(clazz);
+							final MethodType subscription = MethodType.methodType(void.class, parameterClazz);
+							final MethodHandle target = caller.findVirtual(clazz, method.getName(), subscription);
+							final CallSite site = LambdaMetafactory.metafactory(
+								caller,
+								"accept",
+								MethodType.methodType(Consumer.class, clazz),
+								subscription.changeParameterType(0, Object.class),
+								target,
+								subscription);
+
+							final MethodHandle factory = site.getTarget();
+							lambda = (Consumer<Object>) factory.bindTo(object).invokeExact();
+						}
+						catch (Throwable e)
+						{
+							log.warn("Unable to create lambda for method {}", method, e);
+						}
 					}
 				}
 
-				final Subscriber subscriber = new Subscriber(object, method, sub.priority(), lambda);
+				final Subscriber subscriber = new Subscriber(object, method, sub.priority(), lambda, invokerSlot >= 0 ? classInvoker : null, invokerSlot);
 				builder.put(parameterClazz, subscriber);
 				log.debug("Registering {} - {}", parameterClazz, subscriber);
 			}
@@ -203,7 +257,7 @@ public class EventBus
 		builder.orderValuesBy(Comparator.comparingDouble(Subscriber::getPriority).reversed()
 			.thenComparing(s -> s.object.getClass().getName()));
 
-		Subscriber sub = new Subscriber(subFn, null, priority, (Consumer<Object>) subFn);
+		Subscriber sub = new Subscriber(subFn, null, priority, (Consumer<Object>) subFn, null, -1);
 		builder.put(clazz, sub);
 
 		subscribers = builder.build();

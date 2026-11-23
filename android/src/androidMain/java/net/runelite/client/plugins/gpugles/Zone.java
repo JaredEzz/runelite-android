@@ -300,6 +300,11 @@ class Zone
 		int radius;
 		int[] packedFaces;
 
+		int sortDist;
+		char[] sortedFaces;
+		int sortedYaw = -1;
+		int sortedPitch = -1;
+
 		static final int SKIP = 1;
 		static final int TEMP = 2;
 
@@ -429,6 +434,9 @@ class Zone
 			{
 				alphaModels.remove(i);
 				m.packedFaces = null;
+				m.sortedFaces = null;
+				m.sortedYaw = -1;
+				m.sortedPitch = -1;
 				modelCache.add(m);
 			}
 			m.flags &= ~AlphaModel.SKIP;
@@ -460,24 +468,23 @@ class Zone
 		elementBufferId = 0;
 	}
 
+	private static final int ALPHA_BATCH_INTS = 3072;
+	private static final int[] alphaIndexBatch = new int[ALPHA_BATCH_INTS];
+
+	private static void flushAlphaBatch(int batchOff)
+	{
+		if (batchOff > 0)
+		{
+			alphaElements.put(alphaIndexBatch, 0, batchOff);
+		}
+	}
+
 	static class AlphaModelComparator implements Comparator<AlphaModel>
 	{
-		int zx, zz;
-		int cx, cy, cz;
-
 		@Override
 		public int compare(AlphaModel o1, AlphaModel o2)
 		{
-			return Integer.compare(z(o2), z(o1));
-		}
-
-		private int z(AlphaModel m)
-		{
-			final int mx = (m.x + ((zx - m.zofx) << 10));
-			final int mz = (m.z + ((zz - m.zofz) << 10));
-			return (mx - cx) * (mx - cx) +
-				(m.y - cy) * (m.y - cy) +
-				(mz - cz) * (mz - cz);
+			return Integer.compare(o2.sortDist, o1.sortDist);
 		}
 	}
 
@@ -485,8 +492,34 @@ class Zone
 
 	void alphaSort(int zx, int zz, int cx, int cy, int cz)
 	{
-		alphaModelComparator.zx = zx; alphaModelComparator.zz = zz;
-		alphaModelComparator.cx = cx; alphaModelComparator.cy = cy; alphaModelComparator.cz = cz;
+		final int n = alphaModels.size();
+		if (n <= 1) return;
+		for (int i = 0; i < n; ++i)
+		{
+			AlphaModel m = alphaModels.get(i);
+			final int mx = m.x + ((zx - m.zofx) << 10);
+			final int mz = m.z + ((zz - m.zofz) << 10);
+			final int dx = mx - cx;
+			final int dy = m.y - cy;
+			final int dz = mz - cz;
+			m.sortDist = dx * dx + dy * dy + dz * dz;
+		}
+		if (n <= 16)
+		{
+			for (int i = 1; i < n; ++i)
+			{
+				AlphaModel key = alphaModels.get(i);
+				int kd = key.sortDist;
+				int j = i - 1;
+				while (j >= 0 && alphaModels.get(j).sortDist < kd)
+				{
+					alphaModels.set(j + 1, alphaModels.get(j));
+					j--;
+				}
+				alphaModels.set(j + 1, key);
+			}
+			return;
+		}
 		alphaModels.sort(alphaModelComparator);
 	}
 
@@ -555,9 +588,46 @@ class Zone
 			final int[] packedFaces = m.packedFaces;
 			if (diameter >= MAX_DIAMETER) continue;
 
-			Arrays.fill(mu.zsortHead, 0, diameter, (char) -1);
-			Arrays.fill(mu.zsortTail, 0, diameter, (char) -1);
+			if (packedFaces.length * 3 > alphaElements.remaining())
+			{
+				if (packedFaces.length * 3 > alphaElements.capacity())
+				{
+					Log.d(TAG, "Alpha model too large: " + packedFaces.length);
+					continue;
+				}
+				flush();
+			}
 
+			final int start = m.startpos / (VERT_SIZE >> 2);
+			if (packedFaces.length == 1)
+			{
+				alphaElements.put(start).put(start + 1).put(start + 2);
+				continue;
+			}
+
+			final boolean canCache = (m.flags & AlphaModel.TEMP) == 0;
+			if (canCache && m.sortedFaces != null && m.sortedYaw == cyaw && m.sortedPitch == cpitch)
+			{
+				final char[] sorted = m.sortedFaces;
+				int batchOff = 0;
+				for (int k = 0; k < sorted.length; ++k)
+				{
+					if (batchOff + 3 > ALPHA_BATCH_INTS)
+					{
+						flushAlphaBatch(batchOff);
+						batchOff = 0;
+					}
+					int faceIdx = start + sorted[k] * 3;
+					alphaIndexBatch[batchOff++] = faceIdx;
+					alphaIndexBatch[batchOff++] = faceIdx + 1;
+					alphaIndexBatch[batchOff++] = faceIdx + 2;
+				}
+				flushAlphaBatch(batchOff);
+				continue;
+			}
+
+			int minFz = diameter;
+			int maxFz = -1;
 			for (char i = 0; i < packedFaces.length; ++i)
 			{
 				int pack = packedFaces[i];
@@ -572,7 +642,10 @@ class Zone
 
 				assert fz >= 0 && fz < diameter : fz;
 
-				if (mu.zsortTail[fz] == (char) -1)
+				if (fz < minFz) minFz = fz;
+				if (fz > maxFz) maxFz = fz;
+
+				if (mu.zsortHead[fz] == (char) -1)
 				{
 					mu.zsortHead[fz] = mu.zsortTail[fz] = i;
 					mu.zsortNext[i] = (char) -1;
@@ -586,27 +659,44 @@ class Zone
 				}
 			}
 
-			if (packedFaces.length * 3 > alphaElements.remaining())
+			char[] cachedOrder = null;
+			int cacheOut = 0;
+			if (canCache)
 			{
-				if (packedFaces.length * 3 > alphaElements.capacity())
-				{
-					Log.d(TAG, "Alpha model too large: " + packedFaces.length);
-					continue;
-				}
-				flush();
+				cachedOrder = (m.sortedFaces != null && m.sortedFaces.length == packedFaces.length)
+					? m.sortedFaces
+					: new char[packedFaces.length];
 			}
 
-			final int start = m.startpos / (VERT_SIZE >> 2);
-			for (int i = diameter - 1; i >= 0; --i)
+			int batchOff = 0;
+			for (int i = maxFz; i >= minFz; --i)
 			{
-				for (char face = mu.zsortHead[i]; face != (char) -1; face = mu.zsortNext[face])
+				char face = mu.zsortHead[i];
+				if (face == (char) -1) continue;
+				mu.zsortHead[i] = (char) -1;
+				for (; face != (char) -1; face = mu.zsortNext[face])
 				{
-					int faceIdx = face * 3;
-					faceIdx += start;
-					alphaElements.put(faceIdx++);
-					alphaElements.put(faceIdx++);
-					alphaElements.put(faceIdx++);
+					if (cachedOrder != null)
+					{
+						cachedOrder[cacheOut++] = face;
+					}
+					if (batchOff + 3 > ALPHA_BATCH_INTS)
+					{
+						flushAlphaBatch(batchOff);
+						batchOff = 0;
+					}
+					int faceIdx = start + face * 3;
+					alphaIndexBatch[batchOff++] = faceIdx;
+					alphaIndexBatch[batchOff++] = faceIdx + 1;
+					alphaIndexBatch[batchOff++] = faceIdx + 2;
 				}
+			}
+			flushAlphaBatch(batchOff);
+			if (cachedOrder != null)
+			{
+				m.sortedFaces = cachedOrder;
+				m.sortedYaw = cyaw;
+				m.sortedPitch = cpitch;
 			}
 		}
 
@@ -718,6 +808,9 @@ class Zone
 				m2.zofx = (byte) (closestZoneX - zx);
 				m2.zofz = (byte) (closestZoneZ - zz);
 				m2.packedFaces = m.packedFaces;
+				m2.sortedFaces = null;
+				m2.sortedYaw = -1;
+				m2.sortedPitch = -1;
 				m2.radius = m.radius;
 				m2.flags = AlphaModel.TEMP;
 				m.flags |= AlphaModel.SKIP;
