@@ -218,10 +218,15 @@ public class MobileInputPlugin extends Plugin
 				List<Rectangle> rects = new ArrayList<>(64);
 				List<MobileScrollbars.Target> scrollbars = new ArrayList<>();
 				List<MobileSwipeScroll.Target> swipes = new ArrayList<>();
+				staticIndex.clear();
 				for (Widget root : roots)
 				{
+					// Roots use the full isHidden (no visible parent is known yet);
+					// everything below is reached through a visible parent.
+					if (root == null || root.isHidden()) continue;
 					collect(root, rects, scrollbars, swipes, canvasW, canvasH, sx, sy);
 				}
+				staticIndex.clear();
 				Rectangle[] built;
 				if (sx == 1.0 && sy == 1.0)
 				{
@@ -268,6 +273,32 @@ public class MobileInputPlugin extends Plugin
 			(int) Math.round(w * sx), (int) Math.round(h * sy));
 	}
 
+	/** Per-walk index: interface group -> (parent component id -> static children, in group order). */
+	private final java.util.HashMap<Integer, java.util.HashMap<Integer, List<Widget>>> staticIndex = new java.util.HashMap<>();
+
+	/** Same widgets, in the same order, as {@code client.getWidget(id).getStaticChildren()}. */
+	private List<Widget> staticChildren(int componentId)
+	{
+		int group = componentId >>> 16;
+		java.util.HashMap<Integer, List<Widget>> byParent = staticIndex.get(group);
+		if (byParent == null)
+		{
+			byParent = new java.util.HashMap<>();
+			// Component arrays are normally dense; stop after a run of empty slots.
+			for (int child = 0, misses = 0; misses < 64; child++)
+			{
+				Widget s = client.getWidget(group, child);
+				if (s == null) { misses++; continue; }
+				misses = 0;
+				int parent = s.getParentId();
+				if ((parent >>> 16) != group) continue; // group roots hang off another interface
+				byParent.computeIfAbsent(parent, k -> new ArrayList<>()).add(s);
+			}
+			staticIndex.put(group, byParent);
+		}
+		return byParent.get(componentId);
+	}
+
 	/**
 	 * Depth-first walk. A widget contributes to the click-blocking set when it
 	 * intercepts clicks or drags (buttons, inventory slots, bank slider, scrollbars)
@@ -277,22 +308,38 @@ public class MobileInputPlugin extends Plugin
 	private void collect(Widget w, List<Rectangle> out, List<MobileScrollbars.Target> scrollbars, List<MobileSwipeScroll.Target> swipes,
 		int canvasW, int canvasH, double sx, double sy)
 	{
-		// isHidden also covers a hidden ancestor, so a hidden subtree is skipped whole.
-		if (w == null || w.isHidden())
+		collect(w, false, out, scrollbars, swipes, canvasW, canvasH, sx, sy);
+	}
+
+	/** @param dynamicChild a createChild() widget: it shares its parent's id and has no static or nested children. */
+	private void collect(Widget w, boolean dynamicChild, List<Rectangle> out, List<MobileScrollbars.Target> scrollbars,
+		List<MobileSwipeScroll.Target> swipes, int canvasW, int canvasH, double sx, double sy)
+	{
+		// Callers only descend from a visible widget, so the widget's own flag decides
+		// (isHidden() would re-walk the whole parent chain for every node).
+		if (w == null || w.isSelfHidden())
 		{
 			return;
 		}
-		Widget[] dyn = w.getDynamicChildren();
+		final int id = w.getId();
+		// Raw children array instead of getDynamicChildren(), which allocates a filtered
+		// copy for every widget in the tree. Same filter: the child's parent is this widget.
+		Widget[] dyn = w.getChildren();
 		if (dyn != null)
 		{
-			for (Widget c : dyn) collect(c, out, scrollbars, swipes, canvasW, canvasH, sx, sy);
+			for (Widget c : dyn)
+			{
+				if (c != null && c.getParentId() == id) collect(c, true, out, scrollbars, swipes, canvasW, canvasH, sx, sy);
+			}
 		}
-		Widget[] stat = w.getStaticChildren();
+		// getStaticChildren() scans the whole interface group on every call, which made the
+		// walk quadratic in group size; index each group once per walk instead.
+		List<Widget> stat = dynamicChild ? null : staticChildren(id);
 		if (stat != null)
 		{
-			for (Widget c : stat) collect(c, out, scrollbars, swipes, canvasW, canvasH, sx, sy);
+			for (int i = 0, n = stat.size(); i < n; i++) collect(stat.get(i), out, scrollbars, swipes, canvasW, canvasH, sx, sy);
 		}
-		Widget[] nest = w.getNestedChildren();
+		Widget[] nest = dynamicChild ? null : w.getNestedChildren();
 		if (nest != null)
 		{
 			for (Widget c : nest) collect(c, out, scrollbars, swipes, canvasW, canvasH, sx, sy);
