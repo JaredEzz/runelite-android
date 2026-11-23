@@ -700,9 +700,12 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 		// Force a scene rebuild whenever the game transitions back to LOGGED_IN so
 		// freshly-loaded zones get uploaded. The actual upload is driven by the
 		// client calling loadScene/swapScene; this just makes sure we're listening.
-		if (s == GameState.LOADING)
+		if (s == GameState.LOADING && !glInitted)
 		{
-			// Mark all zones as needing rebuild on next swapScene.
+			// Mark all zones as needing rebuild on next swapScene. Only before GL is up:
+			// once it is, loadScene(WorldView, Scene) builds the next zones itself (or
+			// invalidates on its fallback path), and flagging here raced that load -
+			// it refused reusable zones and forced reused ones to rebuild on this thread.
 			if (root != null)
 			{
 				for (int x = 0; x < root.sizeX; ++x)
