@@ -1863,11 +1863,23 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 	@Override
 	public void loadScene(Scene scene)
 	{
-		// Hook for scene-load notifications. Zone (re)builds happen lazily in
-		// preSceneDraw via the invalidate flag.
+		// The engine calls this AND loadScene(WorldView, Scene) for every load, on the Map
+		// Loader thread. For the top-level scene the WorldView overload builds the next
+		// zones off-thread; invalidating every current zone here would both block zone
+		// reuse and let the Client thread rebuild the whole old scene in between.
+		if (scene.getWorldViewId() == WorldView.TOPLEVEL && glInitted && !client.isClientThread())
+		{
+			return;
+		}
+		invalidateAll(scene);
+	}
+
+	/** Flags every zone for a synchronous rebuild in swapScene (fallback path). */
+	private void invalidateAll(Scene scene)
+	{
 		SceneContext ctx = context(scene);
 		if (ctx == null) return;
-		Log.i(TAG, "loadScene(Scene) full invalidate wv=" + scene.getWorldViewId() + " thread=" + Thread.currentThread().getName());
+		Log.i(TAG, "full invalidate wv=" + scene.getWorldViewId() + " thread=" + Thread.currentThread().getName());
 		final Tile[][][] tiles = scene.getExtendedTiles();
 		final int maxX = Math.min(ctx.sizeX, tiles[0].length >> 3);
 		final int maxZ = Math.min(ctx.sizeZ, tiles[0][0].length >> 3);
@@ -1938,7 +1950,7 @@ public class GpuGlesPlugin extends Plugin implements DrawCallbacks
 							ctx.zones[x][z].cull = false;
 			}
 		}
-		loadScene(scene);
+		invalidateAll(scene);
 	}
 
 	/**
