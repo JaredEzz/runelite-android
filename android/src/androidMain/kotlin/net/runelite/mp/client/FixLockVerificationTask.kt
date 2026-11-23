@@ -45,10 +45,12 @@ internal class FixLockVerificationTask {
                 val entries = srcJar.entries()
                 while (entries.hasMoreElements()) {
                     val entry = entries.nextElement()
+                    if (entry.isDirectory) continue
                     srcJar.getInputStream(entry).use { stream ->
                         outJar.putNextEntry(JarEntry(entry.name))
                         if (entry.name.endsWith(".class")) outJar.write(transformClass(stream.readBytes()))
                         else stream.copyTo(outJar)
+                        outJar.closeEntry()
                     }
                 }
             }
@@ -107,7 +109,10 @@ internal object LockStructure {
     }
 
     private sealed class Analysis {
-        class Ok(val exits: List<Pair<AbstractInsnNode, List<Int>>>) : Analysis()
+        class Ok(
+            val exits: List<Pair<AbstractInsnNode, List<Int>>>,
+            val handlerLocks: Map<LabelNode, List<Int>>,
+        ) : Analysis()
         class Err(val reason: String) : Analysis()
     }
 
@@ -120,34 +125,52 @@ internal object LockStructure {
     }
 
     fun fix(m: MethodNode): Result {
-        val exits = when (val a = analyse(m)) {
+        val analysis = when (val a = analyse(m)) {
             is Analysis.Err -> return Result.Bail(a.reason)
-            is Analysis.Ok -> a.exits
+            is Analysis.Ok -> a
         }
+        val exits = analysis.exits
         if (exits.isEmpty()) return Result.Unchanged
+        val handlerLocks = analysis.handlerLocks
         val insns = m.instructions
         for ((insn, locks) in exits) {
+            val firstInserted = LabelNode()
+            insns.insertBefore(insn, firstInserted)
+            val afterUnlock = HashMap<Int, LabelNode>(locks.size * 2)
             // Innermost lock first, like nested synchronized blocks unwinding.
             for (n in locks.asReversed()) {
                 insns.insertBefore(insn, VarInsnNode(Opcodes.ALOAD, n))
                 insns.insertBefore(insn, InsnNode(Opcodes.MONITOREXIT))
+                val lbl = LabelNode()
+                insns.insertBefore(insn, lbl)
+                afterUnlock[n] = lbl
             }
             if (insn.opcode == Opcodes.ATHROW) continue // only uncovered throws are fixed: no handler to adjust
             // The return itself must fall outside every handler range, as in javac output: ART
             // treats a return as able to throw, and a catch-all handler (which releases the lock)
             // reached from after the release would see the lock in two different states.
-            val before = LabelNode()
+            // Each nested lock's handler ends right after its own monitorexit so inner handlers do
+            // not cover outer unlocks with fewer locks held.
             val after = LabelNode()
-            insns.insertBefore(insn, before)
             insns.insert(insn, after)
-            val bi = insns.indexOf(before)
+            val ii = insns.indexOf(insn)
             val ai = insns.indexOf(after)
             var k = 0
             while (k < m.tryCatchBlocks.size) {
                 val t = m.tryCatchBlocks[k]
-                if (insns.indexOf(t.start) <= bi && insns.indexOf(t.end) >= ai) {
+                if (insns.indexOf(t.start) <= ii && insns.indexOf(t.end) >= ai) {
+                    val hLocks = handlerLocks[t.handler]
+                    val splitBefore = if (hLocks == null || hLocks.isEmpty()) {
+                        firstInserted
+                    } else {
+                        var match: LabelNode? = null
+                        for (n in locks.asReversed()) {
+                            if (n in hLocks) { match = afterUnlock[n]; break }
+                        }
+                        match ?: firstInserted
+                    }
                     val parts = ArrayList<TryCatchBlockNode>(2)
-                    if (hasRealInsn(t.start, before)) parts += TryCatchBlockNode(t.start, before, t.handler, t.type)
+                    if (hasRealInsn(t.start, splitBefore)) parts += TryCatchBlockNode(t.start, splitBefore, t.handler, t.type)
                     if (hasRealInsn(after, t.end)) parts += TryCatchBlockNode(after, t.end, t.handler, t.type)
                     m.tryCatchBlocks.removeAt(k)
                     m.tryCatchBlocks.addAll(k, parts)
@@ -164,23 +187,54 @@ internal object LockStructure {
         return false
     }
 
-    private fun real(i: AbstractInsnNode?): AbstractInsnNode? {
+    private fun real(i: AbstractInsnNode?, branchTargets: Set<LabelNode>): AbstractInsnNode? {
         var n = i
-        while (n != null && n.opcode < 0) n = n.previous
+        while (n != null && n.opcode < 0) {
+            if (n is LabelNode && n in branchTargets) return null
+            n = n.previous
+        }
         return n
     }
 
     private fun analyse(m: MethodNode): Analysis {
         val arr = m.instructions.toArray()
         val n = arr.size
-        if (n == 0) return Analysis.Ok(emptyList())
+        if (n == 0) return Analysis.Ok(emptyList(), emptyMap())
         val index = HashMap<AbstractInsnNode, Int>(n * 2)
         for (i in 0 until n) index[arr[i]] = i
-        fun idx(l: LabelNode) = index[l]!!
+        fun idx(l: LabelNode): Int = index[l] ?: -1
+
+        val branchTargets = HashSet<LabelNode>()
+        for (insn in arr) {
+            when (insn) {
+                is JumpInsnNode -> branchTargets.add(insn.label)
+                is TableSwitchInsnNode -> {
+                    branchTargets.add(insn.dflt)
+                    branchTargets.addAll(insn.labels)
+                }
+                is LookupSwitchInsnNode -> {
+                    branchTargets.add(insn.dflt)
+                    branchTargets.addAll(insn.labels)
+                }
+            }
+        }
+        for (t in m.tryCatchBlocks) branchTargets.add(t.handler)
+
+        val tcbs = ArrayList<Triple<Int, Int, TryCatchBlockNode>>(m.tryCatchBlocks.size)
+        for (t in m.tryCatchBlocks) {
+            val st = idx(t.start)
+            val en = idx(t.end)
+            val hd = idx(t.handler)
+            if (st < 0 || en < 0 || hd < 0 || st > en) {
+                return Analysis.Err("dangling or invalid try-catch label")
+            }
+            tcbs.add(Triple(st, en, t))
+        }
 
         val state = arrayOfNulls<List<Int>>(n)
         val work = ArrayDeque<Int>()
         fun push(to: Int, s: List<Int>): String? {
+            if (to < 0 || to >= n) return "dangling label target"
             val old = state[to]
             if (old == null) { state[to] = s; work.addLast(to); return null }
             return if (old != s) "inconsistent lock state at insn $to: $old vs $s" else null
@@ -188,7 +242,6 @@ internal object LockStructure {
 
         state[0] = emptyList(); work.addLast(0)
         val exits = ArrayList<Pair<AbstractInsnNode, List<Int>>>()
-        val tcbs = m.tryCatchBlocks.map { Triple(idx(it.start), idx(it.end), it) }
         while (work.isNotEmpty()) {
             val i = work.removeFirst()
             val insn = arr[i]
@@ -205,9 +258,9 @@ internal object LockStructure {
             var out = s
             when (insn.opcode) {
                 Opcodes.MONITORENTER -> {
-                    val prev = real(insn.previous)
+                    val prev = real(insn.previous, branchTargets)
                     val lock = when {
-                        prev is VarInsnNode && prev.opcode == Opcodes.ASTORE && real(prev.previous)?.opcode == Opcodes.DUP -> prev.`var`
+                        prev is VarInsnNode && prev.opcode == Opcodes.ASTORE && real(prev.previous, branchTargets)?.opcode == Opcodes.DUP -> prev.`var`
                         prev is VarInsnNode && prev.opcode == Opcodes.ALOAD -> prev.`var`
                         else -> return Analysis.Err("unrecognised monitorenter operand at insn $i")
                     }
@@ -215,7 +268,7 @@ internal object LockStructure {
                     out = s + lock
                 }
                 Opcodes.MONITOREXIT -> {
-                    val prev = real(insn.previous)
+                    val prev = real(insn.previous, branchTargets)
                     if (prev !is VarInsnNode || prev.opcode != Opcodes.ALOAD)
                         return Analysis.Err("unrecognised monitorexit operand at insn $i")
                     if (s.isEmpty() || s.last() != prev.`var`)
@@ -260,6 +313,11 @@ internal object LockStructure {
                 }
             }
         }
-        return Analysis.Ok(exits)
+        val handlerLocks = HashMap<LabelNode, List<Int>>(tcbs.size * 2)
+        for ((_, _, t) in tcbs) {
+            val hs = state[idx(t.handler)]
+            if (hs != null) handlerLocks[t.handler] = hs
+        }
+        return Analysis.Ok(exits, handlerLocks)
     }
 }
