@@ -258,24 +258,19 @@ public class Window extends Container implements javax.accessibility.Accessible 
     static final long FORCED_VALIDATE_INTERVAL_MS = 2000;
     private long nextForcedValidate;
 
-    /** Repaint generation (see {@link Component#subtreePaintGeneration()}) seen at the start
-     *  of the last renderToBackbuffer(). A repaint arriving mid-render is newer than this, so
-     *  it correctly schedules another render. */
-    private long renderedPaintGeneration = -1;
-
     /**
      * Cheap "has anything asked for a repaint or relayout since the last render?" check, so
      * the host can skip renderToBackbuffer() (and the full-frame pixel compare after it) on
-     * frames where the chrome cannot have changed. Every Component.repaint()/invalidate()
-     * bumps the generation of all its ancestors, so a mutation anywhere in the attached tree
-     * shows up here. It is not trusted blindly: the host still renders unconditionally at a
+     * frames where the chrome cannot have changed. Every lightweight repaint reaches the
+     * RepaintManager, which remembers the roots dirtied by anything but a Canvas (the game
+     * canvas is GPU-drawn and repaints every frame); invalidate() shows up as !isValid(). It is not trusted blindly: the host still renders unconditionally at a
      * low rate as a safety net for mutators that forget to repaint.
      */
     public boolean needsRender() {
         return backbuffer == null
             || backbuffer.getWidth() != Math.max(1, width) || backbuffer.getHeight() != Math.max(1, height)
             || !isValid()
-            || subtreePaintGeneration() != renderedPaintGeneration;
+            || javax.swing.RepaintManager.currentManager(this).hostHasChromeDirty(this);
     }
 
     /**
@@ -284,7 +279,6 @@ public class Window extends Container implements javax.accessibility.Accessible 
      */
     public BufferedImage renderToBackbuffer() {
         ensureBackbuffer();
-        renderedPaintGeneration = subtreePaintGeneration();
         // The game canvas changes every frame, so the whole buffer is repainted regardless of
         // what was marked and the region itself is not needed; taking it is what keeps it
         // from growing between frames. Repaints raised by the layout and paint below land in
