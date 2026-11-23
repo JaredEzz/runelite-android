@@ -248,11 +248,35 @@ public class Window extends Container implements javax.accessibility.Accessible 
      * forever" into "layout is at most a quarter second late", which is a far better failure
      * mode for something that can't be exhaustively tested here.
      *
-     * It costs four full passes a second instead of sixty. Raise it (or drop the sweep) once
-     * the invalidation coverage has been confirmed on-device.
+     * It costs one full pass per interval instead of sixty. At 250 ms (four a second) the
+     * sweep measured ~35% of the UI thread on a Fire HD 8 — DynamicGridLayout re-measuring
+     * every HTML label, with heavy allocation — so it is now 2000 ms: a missed invalidation
+     * hook shows up at most two seconds late instead of a quarter second. The sweep only
+     * runs inside renderToBackbuffer(), and the host skips that when nothing is dirty
+     * (see {@link #needsRender()}), so an idle window pays for it even less often.
      */
-    static final long FORCED_VALIDATE_INTERVAL_MS = 250;
+    static final long FORCED_VALIDATE_INTERVAL_MS = 2000;
     private long nextForcedValidate;
+
+    /** Repaint generation (see {@link Component#subtreePaintGeneration()}) seen at the start
+     *  of the last renderToBackbuffer(). A repaint arriving mid-render is newer than this, so
+     *  it correctly schedules another render. */
+    private long renderedPaintGeneration = -1;
+
+    /**
+     * Cheap "has anything asked for a repaint or relayout since the last render?" check, so
+     * the host can skip renderToBackbuffer() (and the full-frame pixel compare after it) on
+     * frames where the chrome cannot have changed. Every Component.repaint()/invalidate()
+     * bumps the generation of all its ancestors, so a mutation anywhere in the attached tree
+     * shows up here. It is not trusted blindly: the host still renders unconditionally at a
+     * low rate as a safety net for mutators that forget to repaint.
+     */
+    public boolean needsRender() {
+        return backbuffer == null
+            || backbuffer.getWidth() != Math.max(1, width) || backbuffer.getHeight() != Math.max(1, height)
+            || !isValid()
+            || subtreePaintGeneration() != renderedPaintGeneration;
+    }
 
     /**
      * Render the entire window tree into the backbuffer and return it.
@@ -260,6 +284,7 @@ public class Window extends Container implements javax.accessibility.Accessible 
      */
     public BufferedImage renderToBackbuffer() {
         ensureBackbuffer();
+        renderedPaintGeneration = subtreePaintGeneration();
         // The game canvas changes every frame, so the whole buffer is repainted regardless of
         // what was marked and the region itself is not needed; taking it is what keeps it
         // from growing between frames. Repaints raised by the layout and paint below land in
