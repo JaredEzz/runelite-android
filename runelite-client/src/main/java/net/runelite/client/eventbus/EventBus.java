@@ -35,7 +35,10 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.function.Consumer;
 import javax.annotation.Nonnull;
 import javax.annotation.concurrent.ThreadSafe;
@@ -100,6 +103,8 @@ public class EventBus
 
 	@Nonnull
 	private ImmutableMultimap<Class<?>, Subscriber> subscribers = ImmutableMultimap.of();
+	/** Flat snapshot per event class so {@link #post} avoids ImmutableMultimap/Guava iterators in hot loops. */
+	private volatile IdentityHashMap<Class<?>, Subscriber[]> subscriberArrays = new IdentityHashMap<>();
 
 	/**
 	 * Instantiates EventBus with default exception handler
@@ -188,6 +193,7 @@ public class EventBus
 		}
 
 		subscribers = builder.build();
+		rebuildArrays();
 	}
 
 	public synchronized <T> Subscriber register(Class<T> clazz, Consumer<T> subFn, float priority)
@@ -201,6 +207,7 @@ public class EventBus
 		builder.put(clazz, sub);
 
 		subscribers = builder.build();
+		rebuildArrays();
 
 		return sub;
 	}
@@ -216,6 +223,7 @@ public class EventBus
 			subscribers.entries(),
 			e -> e.getValue().getObject() != object
 		));
+		rebuildArrays();
 	}
 
 	public synchronized void unregister(Subscriber sub)
@@ -229,6 +237,22 @@ public class EventBus
 			subscribers.entries(),
 			e -> sub != e.getValue()
 		));
+		rebuildArrays();
+	}
+
+	private void rebuildArrays()
+	{
+		Map<Class<?>, Collection<Subscriber>> asMap = subscribers.asMap();
+		IdentityHashMap<Class<?>, Subscriber[]> next = new IdentityHashMap<>(asMap.size() * 2 + 1);
+		for (Map.Entry<Class<?>, Collection<Subscriber>> entry : asMap.entrySet())
+		{
+			Collection<Subscriber> list = entry.getValue();
+			if (!list.isEmpty())
+			{
+				next.put(entry.getKey(), list.toArray(new Subscriber[0]));
+			}
+		}
+		subscriberArrays = next;
 	}
 
 	/**
@@ -239,11 +263,16 @@ public class EventBus
 	 */
 	public void post(@Nonnull final Object event)
 	{
-		for (final Subscriber subscriber : subscribers.get(event.getClass()))
+		final Subscriber[] subs = subscriberArrays.get(event.getClass());
+		if (subs == null)
+		{
+			return;
+		}
+		for (int i = 0, len = subs.length; i < len; i++)
 		{
 			try
 			{
-				subscriber.invoke(event);
+				subs[i].invoke(event);
 			}
 			catch (Exception e)
 			{
